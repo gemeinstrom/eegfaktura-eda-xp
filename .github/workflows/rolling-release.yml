@@ -1,33 +1,9 @@
-# Scala/sbt mit sbt-native-packager (kein Dockerfile). Build-Stack ist auf
-# Apache Pekko migriert (statt Akka BSL) - keine repo.akka.io-Auth noetig,
-# Dependencies kommen aus Maven Central.
-#
-# Pusht ins Development-Tier ghcr.io/vfeeg-development/eegfaktura-kep
-# gemaess ADR-0005 (Two-Tier-Image-Registry) im Platform-Repo.
-#
-# Build-Flow:
-#   1. setup-java (Temurin 17, matched dockerBaseImage in build.sbt)
-#   2. setup-sbt
-#   3. GHCR-Login mit VFEEG_DEV_PUSH_PAT (nur push-events, PRs pushen nicht)
-#   4. PR-Event:    sbt Docker/publishLocal  (Build-Check, kein Push)
-#      Push-Event:  sbt Docker/publish       (Build + Push)
-#        - build.sbt setzt dockerUsername := Some("vfeeg-development") und die
-#          dockerAliases pushen eegfaktura-kep ebenfalls nach vfeeg-development —
-#          kein Override im Workflow mehr noetig.
-#
-# Image-Pfad: ghcr.io/vfeeg-development/eegfaktura-kep (via dockerAliases) plus
-# Default-Alias ghcr.io/vfeeg-development/eda-xp-connector (vom packageName).
-#
-# Voll-Pipeline Stufe 3: Build + Push + dispatch-deploy zum Platform-Repo.
-#
-# Vorbedingungen:
-#   - VFEEG_DEV_PUSH_PAT-Secret im Source-Repo — Classic PAT mit
-#     write:packages auf vfeeg-development (Cross-Org-Push)
-#   - PLATFORM_DEPLOY_PAT-Secret im Source-Repo — fuer Cross-Repo-Dispatch
-#     (Fine-grained Token 'eegfaktura-platform-dispatch')
-#   - Mapping `deploy-eda-xp` in Platform-Workflow deploy-on-dispatch.yml (vorhanden)
-#   - K8s-Manifest k8s/70-eda-xp.yaml zeigt auf
-#     ghcr.io/vfeeg-development/eegfaktura-kep:latest mit imagePullPolicy: Always
+# gemeinstrom-Fork-Variante des upstream rolling-release-Workflows.
+# Delta zum Upstream (eegfaktura/eegfaktura-eda-xp):
+#   - Login mit GITHUB_TOKEN statt VFEEG_DEV_PUSH_PAT (same-org push)
+#   - dispatch-deploy Jobs entfernt (Cutover läuft kontrolliert manuell)
+#   - build.sbt separat: dockerUsername := Some("gemeinstrom") (drei Stellen)
+# Aufgesetzt im Rahmen des Cutover-Plans 2026-07-12.
 
 name: Docker Image CI (sbt-native-packager)
 
@@ -77,81 +53,18 @@ jobs:
             sbt-${{ runner.os }}-
 
       - name: Login to Container Registry
-        # Push cross-org nach vfeeg-development/* (Development-Tier, ADR-0005).
-        # GITHUB_TOKEN dieses Repos ist auf eegfaktura/* beschraenkt — daher der
-        # Classic-PAT VFEEG_DEV_PUSH_PAT (write:packages auf vfeeg-development).
-        # GHCR validiert via Token, nicht via username — github.actor bleibt.
-        # PR-Builds duerfen nicht pushen — Login-Step nur bei push.
+        # Same-Org push nach ghcr.io/gemeinstrom/* — GITHUB_TOKEN reicht.
         if: github.event_name == 'push'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.VFEEG_DEV_PUSH_PAT }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build (PR via Docker/publishLocal) / Build+Push (push via Docker/publish)
         run: |
-          # Kein dockerUsername-Override mehr: build.sbt setzt bereits
-          # dockerUsername := Some("vfeeg-development") und die dockerAliases
-          # pushen eegfaktura-kep ebenfalls nach vfeeg-development (Development-Tier).
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             sbt Docker/publishLocal
           else
             sbt Docker/publish
           fi
-
-  # Triggert das Platform-Repo, damit es den Cluster aktualisiert.
-  # Laeuft nur bei push to default-branch (master/main), nicht bei PRs oder Tags.
-  # Vorbedingung: PLATFORM_DEPLOY_PAT-Secret muss im Source-Repo gesetzt sein
-  # (Fine-grained PAT 'eegfaktura-platform-dispatch' mit Repository-Dispatch-Write
-  # auf vfeeg-development/eegfaktura-platform).
-  dispatch-deploy:
-    needs: build-and-push-image
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger deploy in platform repo
-        env:
-          GH_TOKEN: ${{ secrets.PLATFORM_DEPLOY_PAT }}
-        run: |
-          PAYLOAD=$(cat <<EOF
-          {
-            "event_type": "deploy-eda-xp",
-            "client_payload": {
-              "image_tag": "latest",
-              "source_sha": "${GITHUB_SHA}",
-              "source_repo": "${GITHUB_REPOSITORY}",
-              "source_ref": "${GITHUB_REF}"
-            }
-          }
-          EOF
-          )
-          echo "$PAYLOAD" | gh api repos/vfeeg-development/eegfaktura-platform/dispatches --input -
-          echo "Dispatched deploy-eda-xp for sha=${GITHUB_SHA:0:8}"
-
-  # Preview-Deploy (ADR-0007): Push auf preview/** -> pinned Deploy des sha-Builds
-  # in die Dev-Zone, ohne main/Release anzufassen. Nur auf preview/**-Branches.
-  dispatch-preview-deploy:
-    needs: build-and-push-image
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/preview/')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger pinned preview deploy in platform repo
-        env:
-          GH_TOKEN: ${{ secrets.PLATFORM_DEPLOY_PAT }}
-        run: |
-          PAYLOAD=$(cat <<EOF
-          {
-            "event_type": "deploy-eda-xp",
-            "client_payload": {
-              "mode": "pinned",
-              "image_tag": "sha-${GITHUB_SHA:0:7}",
-              "source_sha": "${GITHUB_SHA}",
-              "source_repo": "${GITHUB_REPOSITORY}",
-              "source_ref": "${GITHUB_REF}"
-            }
-          }
-          EOF
-          )
-          echo "$PAYLOAD" | gh api repos/vfeeg-development/eegfaktura-platform/dispatches --input -
-          echo "Dispatched pinned preview deploy-eda-xp for sha-${GITHUB_SHA:0:7}"

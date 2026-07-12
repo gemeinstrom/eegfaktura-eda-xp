@@ -60,7 +60,7 @@ lazy val dockerSettings = Seq(
   dockerBaseImage := "eclipse-temurin:17-jre",
   dockerExposedVolumes := Seq("/conf", "/storage/prod"),
   dockerRepository := Some("ghcr.io"),
-  dockerUsername := Some("vfeeg-development"),
+  dockerUsername := Some("gemeinstrom"),
 //  dockerUpdateLatest := true,
   dockerExposedPorts := Seq(6090, 9093),
   dockerCommands := dockerCommands.value.filterNot {
@@ -77,10 +77,10 @@ lazy val dockerSettings = Seq(
     val repo = dockerRepository.value
 
     Seq(
-//      DockerAlias(repo, Some("vfeeg-development"), name, Some(dockerVersion)),      // e.g. ghcr.io/eegfaktura/app:1.0.0
-//      DockerAlias(repo, Some("vfeeg-development"), name, Some("latest")),
-      DockerAlias(repo, Some("vfeeg-development"), "eegfaktura-kep", Some((ThisBuild / version).value)),
-      DockerAlias(repo, Some("vfeeg-development"), "eegfaktura-kep", Some("latest")),
+//      DockerAlias(repo, Some("gemeinstrom"), name, Some(dockerVersion)),      // e.g. ghcr.io/eegfaktura/app:1.0.0
+//      DockerAlias(repo, Some("gemeinstrom"), name, Some("latest")),
+      DockerAlias(repo, Some("gemeinstrom"), "eegfaktura-kep", Some((ThisBuild / version).value)),
+      DockerAlias(repo, Some("gemeinstrom"), "eegfaktura-kep", Some("latest")),
     )
   }
 )
