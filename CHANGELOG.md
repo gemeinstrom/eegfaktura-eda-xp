@@ -8,6 +8,42 @@ this changelog highlights the changes relevant for overview and operations.
 
 ## [Unreleased]
 
+### Added
+- CI builds `env/**` branches and deploys the resulting image into the matching feature
+  environment (ADR-0008): a push to `env/<name>` pins this service in namespace `env-<name>`
+  to that branch's `sha-…` image. Previously only the default branch, tags and `preview/**`
+  produced an image at all. The environment itself is still provisioned manually.
+
+### Fixed
+- The Docker build now publishes a `sha-<short>` tag. Unlike the other services, this repo
+  is packaged by sbt-native-packager rather than `docker/metadata-action`, which never
+  produced that tag — while both the preview deploy (ADR-0007) and the new env deploy
+  (ADR-0008) pin exactly it. Every such deploy therefore ended in `ImagePullBackOff`;
+  it first showed up on 2026-09-26 with the first `env/billing` build.
+- A build from a `preview/**` or `env/**` branch no longer overwrites the moving tags
+  `latest` and `v0.2.22` in the development tier. The dev zone pulls `eegfaktura-kep:latest`,
+  so a feature build silently became the dev zone's next image — which is what happened on
+  2026-09-26. Those branches now publish their `sha-` tag only; default-branch and tag
+  builds are unchanged.
+
+## [1.0.3] – 2026-09-07
+
+### Docs
+- README: added "Adding a new EDA process version" — documents that outbound process
+  versions are stamped by the backend (`eda-process-versions`) and selected here by
+  `getVersion()` string match (unmatched → silent downgrade via `case _`), and the
+  in-order convention to update eda-xp XSD/`getVersion` **and** all backend-config copies
+  (Prod CM + repo default + dev/env overlays). New-version discovery is handled by the
+  monthly EDA-Prozessversionen-Watcher routine.
+
+### Fixed
+- Test module no longer compiles-broken: `CMRequestOnline/OfflineRegistrationSpec` and
+  `ECPartitionChangeSpec` called `.getTime` on `MessageHelper.getProcessDate`, which had been
+  refactored from a `Calendar` to a `String` (the ready `yyyy-MM-dd` process date) — so the
+  whole `Test` scope failed to compile and no eda-xp test could run. Use `getProcessDate`
+  directly (identical value) and drop the now-unused `buildCalendarDate` import in the two
+  CMRequest specs.
+
 ## [1.0.2] – 2026-07-05
 
 ### Fixed
