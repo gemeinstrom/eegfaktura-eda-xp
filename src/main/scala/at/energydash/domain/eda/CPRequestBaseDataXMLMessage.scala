@@ -11,7 +11,13 @@ import scala.util.Try
 import scala.xml.{NamespaceBinding, Node, XML}
 
 case class CPRequestBaseData(message: EbMsMessage) extends EdaMessage {
-  override def getVersion(version: Option[String] = None): Try[EdaXMLMessage[_]] = Try(CPRequestBaseDataXMLMessage(message))
+  // Like every other request, ANFORDERUNG_GN needs the label of the schema set the body is built
+  // for (MD_REQ_GN 03.12, see schemaLocation): it goes into the Ponton header as MessageVersion
+  // (without one the header said 01.00, platform#111).
+  override def getVersion(version: Option[String] = None): Try[EdaXMLMessage[_]] = message.messageCodeVersion match {
+    case Some("03.12") => Try(CPRequestBaseDataXMLMessage(message))
+    case _ => fallbackVersion()
+  }
 }
 
 case class CPRequestBaseDataXMLMessage(message: EbMsMessage) extends EdaXMLMessage[cprequest.v01p12.CPRequest] {
@@ -33,7 +39,7 @@ case class CPRequestBaseDataXMLMessage(message: EbMsMessage) extends EdaXMLMessa
   def toXML: Node = {
     rewriteRootSchema(scalaxb.toXML[cprequest.v01p12.CPRequest](toDoc, Some("http://www.ebutilities.at/schemata/customerprocesses/cprequest/01p12"), Some("CPRequest"),
       toScope,
-      typeAttribute = false).head, "CPRequest",
+      typeAttribute = false).head,
       "http://www.ebutilities.at/schemata/customerprocesses/cprequest/01p12 CPRequest_01p12.xsd")
 
   }
@@ -47,20 +53,3 @@ case class CPRequestBaseDataXMLMessage(message: EbMsMessage) extends EdaXMLMessa
     ByteString.fromString(xmlString.toString)
   }
 }
-
-//object CPRequestBaseDataXMLMessage extends EdaResponseType {
-//  def fromXML(xmlFile: Elem): Try[CPRequestBaseData] = {
-//    Try(scalaxb.fromXML[cprequest.v01p12.CPRequest](xmlFile)).map(document =>
-//      CPRequestBaseData(
-//        EbMsMessage(
-//          messageId = Some(document.ProcessDirectory.MessageId),
-//          conversationId = document.ProcessDirectory.ConversationId,
-//          sender = document.MarketParticipantDirectory.RoutingHeader.Sender.MessageAddress,
-//          receiver = document.MarketParticipantDirectory.RoutingHeader.Receiver.MessageAddress,
-//          messageCode = EbMsMessageType.withName(document.MarketParticipantDirectory.MessageCode.toString),
-//          messageCodeVersion = Some("01.12"),
-//        )
-//      )
-//    )
-//  }
-//}

@@ -10,12 +10,22 @@ lazy val courierVersion  = "3.0.1"
 lazy val pekkoVersion             = "1.2.1"
 lazy val pekkoHttpVersion         = "1.2.0"
 lazy val pekkoConnectorsVersion   = "1.1.0"
-lazy val circeVersion             = "0.14.3"
+lazy val circeVersion             = "0.14.16"
 lazy val slickVersion             = "3.5.1"
 lazy val scalaXmlVersion          = "2.3.0"
+// gRPC comes in through pekko-grpc-runtime (1.67.1); raised for the security scan (platform#182).
+// All io.grpc modules share one version.
+lazy val grpcVersion              = "1.75.0"
+// the protobuf-java that grpc-protobuf (grpcVersion) depends on; raise both together
+lazy val protobufVersion          = "3.25.8"
+// Jackson comes in through pekko-serialization-jackson (2.19.2); raised for the security scan
+// (platform#182). Since 2.20 jackson-annotations is versioned without a patch number.
+// On the next Pekko / pekko-grpc upgrade: compare with what they bring, and raise or remove the
+// gRPC, protobuf and Jackson pins and dependencyOverrides below.
+lazy val jacksonVersion           = "2.21.7"
+lazy val jacksonAnnotationsVersion = "2.21"
 
 lazy val scalaxbSettings = Seq(
-  Compile / scalaxbJaxbPackage := JaxbPackage.Jakarta,
   Compile / scalaxb / scalaxbPackageName := "generated",
   Compile / scalaxb / scalaxbPackageNames := Map(
     uri("http://xp.ponton.de/eda/v320") -> "ponton",
@@ -67,7 +77,14 @@ lazy val dockerSettings = Seq(
     case ExecCmd("ENTRYPOINT", _) => true
     case cmd => false
   },
-  dockerEnvVars := Map("TZ" -> "Europe/Vienna", "JAVA_OPTS" -> "-Xmx4g"),
+  // LOG_FORMAT/SERVICE_VERSION: JSON log lines in the image, service.version = the tag for a tag build, the commit
+  // for any other CI build (a retagged image keeps it), the sbt version for a local image build
+  dockerEnvVars := Map("TZ" -> "Europe/Vienna", "JAVA_OPTS" -> "-Xmx4g", "LOG_FORMAT" -> "json",
+    "SERVICE_VERSION" -> {
+      val v = (ThisBuild / version).value.stripPrefix("v")
+      val tag = sys.env.get("GITHUB_REF_NAME").filter(_ => sys.env.getOrElse("GITHUB_REF", "").startsWith("refs/tags/"))
+      tag.map(_.stripPrefix("v")).orElse(sys.env.get("GITHUB_SHA").filter(_.nonEmpty)).getOrElse(v)
+    }),
   dockerCommands ++= Seq(
     Cmd("LABEL", s"""version="${ThisBuild / version}""""),
     ExecCmd("CMD", "/opt/docker/bin/xpadapter", "-Dconfig.file=/conf/application.conf")
@@ -102,6 +119,33 @@ lazy val dockerSettings = Seq(
   }
 )
 
+// Test environment (docs: scripts/dev/test.sh). One forked JVM, suites one after another, fixed zone,
+// the test configuration by resource name (ScalaTestWithActorTestKit loads `application-test` by name),
+// every file a test writes under target/. EDA_XP_EXTRA_TESTS adds a private test directory for one run.
+lazy val testSettings = Seq(
+  Test / fork := true,
+  Test / parallelExecution := false,
+  Test / testForkedParallel := false,
+  Test / javaOptions ++= Seq(
+    "-Duser.timezone=Europe/Vienna",
+    "-Dconfig.resource=application-test.conf",
+    s"-Djava.io.tmpdir=${(ThisBuild / baseDirectory).value / "target" / "test-tmp"}",
+    s"-Deda.test.storage=${(ThisBuild / baseDirectory).value / "target" / "test-storage"}",
+    // embedded PostgreSQL on a free port per run: a server left over by a killed run cannot collide (XP-CQ-37)
+    s"-Deda.test.db.port=${{ val s = new java.net.ServerSocket(0); try s.getLocalPort finally s.close() }}",
+  ) ++ sys.props.get("eda.golden.update").map(v => s"-Deda.golden.update=$v").toSeq,
+  Test / unmanagedSourceDirectories ++= sys.env.get("EDA_XP_EXTRA_TESTS").map(file).toSeq,
+  Test / testOptions += Tests.Setup(() => IO.createDirectory((ThisBuild / baseDirectory).value / "target" / "test-tmp")),
+  // Coverage (sbt-scoverage): generated scalaxb and pekko-grpc code excluded; floors below.
+  coverageExcludedPackages := Seq("generated", "ponton", "soapenvelope11", "scalaxb", "dataplatform",
+    "cmnotification", "ecmplist", "gcrequestap", "gcrequest", "consumptionrecord", "cmrequest", "cmrevoke",
+    "cpnotification", "cprequest", "commontypes", "cpdocument", "xmlschema", "at\\.energydash\\.admin")
+    .map(p => s"$p\\..*").mkString(";"),
+  coverageFailOnMinimum := true,
+  coverageMinimumStmtTotal := 79,   // floors: the clean run rounded down, raised per milestone, never lowered;
+  coverageMinimumBranchTotal := 62, // per-package floors in scripts/dev/coverage-floors.txt
+)
+
 lazy val root = (project in file("."))
   .enablePlugins(ScalaxbPlugin)
   .enablePlugins(PekkoGrpcPlugin)
@@ -110,6 +154,9 @@ lazy val root = (project in file("."))
   .settings(dockerSettings)
   .settings(
     name := "XPAdapter",
+
+    // warnings stay non-fatal; the generated scalaxb/gRPC sources under src_managed are silenced
+    scalacOptions ++= Seq("-deprecation", "-Wunused:imports,privates,locals", "-Wconf:src=src_managed/.*:s"),
 
     resolvers += "Typesafe repository" at "https://repo.typesafe.com/typesafe/releases/",
     resolvers += "repo.jenkins-ci.org" at "https://repo.jenkins-ci.org/releases",
@@ -122,27 +169,55 @@ lazy val root = (project in file("."))
       "org.apache.pekko" %% "pekko-actor-typed" % pekkoVersion,
       "org.apache.pekko" %% "pekko-stream" % pekkoVersion,
       "org.apache.pekko" %% "pekko-persistence-typed" % pekkoVersion,
-      "org.apache.pekko" %% "pekko-serialization-jackson"  % pekkoVersion,
+      ("org.apache.pekko" %% "pekko-serialization-jackson"  % pekkoVersion).exclude("org.lz4", "lz4-java"),
       "org.apache.pekko" %% "pekko-discovery" % pekkoVersion,
       "org.apache.pekko" %% "pekko-slf4j" % pekkoVersion,
       "org.apache.pekko" %% "pekko-connectors-mqtt" % pekkoConnectorsVersion,
-      "org.apache.pekko" %% "pekko-connectors-mqtt-streaming" % pekkoConnectorsVersion,
       "com.github.pjfanning" %% "pekko-http-circe" % "3.1.0",
       "jakarta.xml.bind" % "jakarta.xml.bind-api" % "4.0.2",
 //      "org.http4s" %% "http4s-core" % "1.0.0-m38",
 
-      "com.typesafe.scala-logging" %% "scala-logging" % "3.9.5",
       "ch.qos.logback" % "logback-classic" % "1.5.6",
       "org.slf4j" % "jcl-over-slf4j" % "2.0.13",
+      "org.slf4j" % "jul-to-slf4j" % "2.0.17",
 
       "org.fusesource.leveldbjni" % "leveldbjni-all" % "1.8",
 
-      "javax.xml.bind" % "jaxb-api" % scalaXmlVersion,
-      "com.sun.xml.bind" % "jaxb-core" % scalaXmlVersion,
       "org.scala-lang.modules" %% "scala-xml" % scalaXmlVersion,
 //      "org.scala-lang.modules" %% "scala-parser-combinators" % "1.1.2",
 
-      "com.google.guava" % "guava" % "33.2.1-jre",
+      "com.google.guava" % "guava" % "33.3.1-jre", // grpc 1.75 brings 33.3.1-android; keep the -jre build
+
+      // transitive, declared directly so that the exported pom (security scan) carries the fixed version
+      "io.grpc" % "grpc-netty-shaded" % grpcVersion,
+      // scalapb-runtime asks for 3.19.6; sbt already resolves the version grpc-protobuf brings
+      "com.google.protobuf" % "protobuf-java" % protobufVersion,
+      "com.fasterxml.jackson.core" % "jackson-core" % jacksonVersion,
+      "com.fasterxml.jackson.core" % "jackson-databind" % jacksonVersion,
+      // flyway-core asks for 2.15.2; kept with the other Jackson modules
+      "com.fasterxml.jackson.dataformat" % "jackson-dataformat-toml" % jacksonVersion,
+      // org.lz4 is abandoned; at.yawk.lz4 is the maintained fork (same net.jpountz packages)
+      "at.yawk.lz4" % "lz4-java" % "1.11.4",
+    ),
+
+    dependencyOverrides ++= Seq(
+      "grpc-api", "grpc-context", "grpc-core", "grpc-netty-shaded", "grpc-protobuf",
+      "grpc-protobuf-lite", "grpc-stub", "grpc-util",
+    ).map("io.grpc" % _ % grpcVersion),
+
+    // guava comes in through gRPC; 33.7.2 fixes CVE-2026-102554
+    dependencyOverrides += "com.google.guava" % "guava" % "33.7.2-jre",
+
+    // jackson-module-scala refuses a databind of another minor version: all modules move together
+    dependencyOverrides ++= Seq(
+      "com.fasterxml.jackson.core" % "jackson-core" % jacksonVersion,
+      "com.fasterxml.jackson.core" % "jackson-databind" % jacksonVersion,
+      "com.fasterxml.jackson.core" % "jackson-annotations" % jacksonAnnotationsVersion,
+      "com.fasterxml.jackson.dataformat" % "jackson-dataformat-cbor" % jacksonVersion,
+      "com.fasterxml.jackson.datatype" % "jackson-datatype-jdk8" % jacksonVersion,
+      "com.fasterxml.jackson.datatype" % "jackson-datatype-jsr310" % jacksonVersion,
+      "com.fasterxml.jackson.module" % "jackson-module-parameter-names" % jacksonVersion,
+      "com.fasterxml.jackson.module" %% "jackson-module-scala" % jacksonVersion,
     ),
 
     libraryDependencies ++= Seq(
@@ -150,13 +225,8 @@ lazy val root = (project in file("."))
       "org.apache.pekko" %% "pekko-stream-testkit" % pekkoVersion,
       "org.apache.pekko" %% "pekko-actor-testkit-typed" % pekkoVersion,
       "org.jvnet.mock-javamail" % "mock-javamail" % "1.12",
-      "com.typesafe.slick" %% "slick-testkit" % slickVersion,
-      "com.h2database" % "h2" % "2.2.224",
       "com.opentable.components" % "otj-pg-embedded" % "0.13.3",
-      "org.flywaydb" % "flyway-core" % "7.2.0",
-      "org.mockito" %% "mockito-scala" % "1.17.31",
       "org.scalamock" %% "scalamock" % "6.0.0",
-      "com.typesafe.slick" %% "slick-testkit" % slickVersion,
       "io.moquette"      % "moquette-broker"  % "0.17",
     ).map(_ % Test),
 
@@ -169,7 +239,7 @@ lazy val root = (project in file("."))
     libraryDependencies ++= Seq(
       "com.typesafe.slick" %% "slick" % slickVersion,
       "com.typesafe.slick" %% "slick-hikaricp" % slickVersion,
-      "org.postgresql" % "postgresql" % "42.7.3",
+      "org.postgresql" % "postgresql" % "42.7.14",
       "com.github.tminglei" %% "slick-pg" % "0.22.2",
       "com.github.tminglei" %% "slick-pg_circe-json" % "0.22.2"
     ),
@@ -181,3 +251,4 @@ lazy val root = (project in file("."))
 
     testOptions += Tests.Argument(TestFrameworks.JUnit, "-q", "-v", "-s", "-a")
   )
+  .settings(testSettings)

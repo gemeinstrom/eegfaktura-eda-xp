@@ -3,9 +3,9 @@ package at.energydash.stream
 import org.apache.pekko.actor.typed.{ActorRef, ActorSystem}
 import org.apache.pekko.stream.connectors.mqtt.scaladsl.{MqttSink, MqttSource}
 import org.apache.pekko.stream.connectors.mqtt.{MqttConnectionSettings, MqttMessage, MqttQoS, MqttSubscriptions}
-import org.apache.pekko.stream.scaladsl.{Flow, Sink, Source}
+import org.apache.pekko.stream.scaladsl.{Flow, RestartSink, RestartSource, Sink, Source}
 import org.apache.pekko.stream.typed.scaladsl.ActorFlow
-import org.apache.pekko.stream.{ActorAttributes, Supervision}
+import org.apache.pekko.stream.{ActorAttributes, RestartSettings, Supervision}
 import org.apache.pekko.util.{ByteString, Timeout}
 import org.apache.pekko.{Done, NotUsed}
 import at.energydash.actors.ConversationEntity.{InitConversation, InitDone}
@@ -13,6 +13,7 @@ import at.energydash.actors._
 import at.energydash.config.Config
 import at.energydash.domain.eda.MessageHelper.EDAMessageCodeToProcessCode
 import at.energydash.domain.{DefaultEbMsMessage, EbMsMessage}
+import at.energydash.logging.{LogFields, LogText}
 import at.energydash.mqtt.path.MqttPaths
 import io.circe.generic.auto._
 import io.circe.parser.decode
@@ -21,8 +22,7 @@ import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
 import org.slf4j.{Logger, LoggerFactory}
 
 import scala.concurrent.duration.DurationInt
-import scala.concurrent.{ExecutionContextExecutor, Future}
-import scala.util.Try
+import scala.concurrent.{ExecutionContextExecutor, Future, Promise}
 
 class MqttRequestStream(tenantService: ActorRef[EdaCommand],
                         messageTransformer: ActorRef[PrepareMessageActor.Command[PrepareMessageActor.PrepareMessageResult]],
@@ -40,13 +40,13 @@ class MqttRequestStream(tenantService: ActorRef[EdaCommand],
     cause.foreach(initCause)
   }
 
-  private val decodingFlow: Flow[String, EbMsMessage, NotUsed] = {
-    Flow.fromFunction(msg => decode[EbMsMessage](msg) match {
+  private val decodingFlow: Flow[Either[io.circe.Error, EbMsMessage], EbMsMessage, NotUsed] = {
+    Flow.fromFunction {
       case Right(m) => m
       case Left(error) => throw MqttException(
         MqttMessage(s"${Config.errorTopic}",
-          ByteString(DefaultEbMsMessage.Error("Parse Payload", Some(error.getMessage)).asJson.toString())), error.getMessage)
-    })
+          ByteString(DefaultEbMsMessage.Error("Parse Payload", Some(error.getMessage)).asJson.toString())), LogText.decodeError(error))
+    }
   }
 
   private val prepareMessageFlow: Flow[EbMsMessage, EbMsMessage, NotUsed] =
@@ -57,33 +57,42 @@ class MqttRequestStream(tenantService: ActorRef[EdaCommand],
         message
     }
 
-  private val storeMessageFlow: Flow[EbMsMessage, MqttMessage, NotUsed] =
+  // Store the conversation BEFORE sending (platform#111 ca6): if the send times out on our side
+  // but Ponton accepted the message, later answers still find their request and get ecId, meter
+  // and consent end merged. ConversationEntity replies before the insert completes, so a slow or
+  // failing DB neither delays nor blocks the send. A request that is then not sent (unknown label,
+  // send error) leaves a conversation row behind; it is never matched by an answer.
+  private val storeMessageFlow: Flow[EbMsMessage, EbMsMessage, NotUsed] =
     ActorFlow.ask(conversationEntity)(InitConversation).collect {
-      case InitDone(id) => Try {
-        edaReqResPath(id.sender, EDAMessageCodeToProcessCode(id.messageCode).toString)
-      } fold(
-        exc => throw exc,
-        topic => {
-          MqttMessage(
-            topic,
-            ByteString(id.asJson.toString()))
-//            .withQos(MqttQoS.atLeastOnce).withRetained(false)
-        })
+      case InitDone(message) => message
     }
 
-  private def fakeFlow: Flow[EbMsMessage, MqttMessage, NotUsed] =
-    Flow[EbMsMessage].map( m =>
+  private val responseFlow: Flow[EbMsMessage, MqttMessage, NotUsed] =
+    Flow[EbMsMessage].map { m =>
       MqttMessage(
         edaReqResPath(m.sender, EDAMessageCodeToProcessCode(m.messageCode).toString),
-        ByteString(m.asJson.toString())))
+        ByteString(m.asJson.toString()))
+    }
+
+  /**
+   * Runs `body` with the tenant (sender) and EDA ConversationId of the request in the MDC, when it decoded; the
+   * encoder writes the sender as `tenant.id` only in the shape of a tenant.
+   */
+  private def withRequest[T](request: Option[EbMsMessage])(body: => T): T =
+    LogFields.withMdc(
+      LogFields.TenantId -> request.map(_.sender),
+      LogFields.ConversationId -> request.map(_.conversationId))(body)
 
   private def commandFlow(input: String): Future[MqttMessage] = {
-    Source.single[String](input)
+    // decoded once: for the stream and for the fields of its error lines
+    val decoded = decode[EbMsMessage](input)
+    Source.single(decoded)
       .via(decodingFlow)
       .via(prepareMessageFlow)
+      .via(storeMessageFlow)
       .via(
         ActorFlow.ask(parallelism = 1)(tenantService)((msg: EbMsMessage, replyTo: ActorRef[EdaCommand]) =>
-          PassEdaCommand(msg.sender, msg, replyTo))(30.seconds).collect {
+          PassEdaCommand(msg.sender, msg, replyTo, createdAt = System.nanoTime()))(TenantProvider.PassAskTimeout).collect {
           case SendEdaResponse(msg) => msg
           case err: SendResponseError =>
             throw MqttException(MqttMessage(
@@ -92,14 +101,13 @@ class MqttRequestStream(tenantService: ActorRef[EdaCommand],
                 DefaultEbMsMessage.Error("0", err.tenant, err.receiver, err.message, Some(err.step)).asJson.toString())), err.message)
         }
       )
-      .via(storeMessageFlow)
-//      .via(fakeFlow)
+      .via(responseFlow)
       .recover {
         case me: MqttException =>
-          logger.error(s"Error Stream handling - ${me.getMessage} (${input})")
+          withRequest(decoded.toOption)(logger.error("Error Stream handling", me))
           me.errorMsg
         case e =>
-          logger.error(s"Recover: ${e.getMessage} (${input})")
+          withRequest(decoded.toOption)(logger.error("Recover", e))
           MqttMessage("eda/response/error", ByteString(e.getMessage))
       }.runWith(Sink.head[MqttMessage])
   }
@@ -109,7 +117,7 @@ class MqttRequestStream(tenantService: ActorRef[EdaCommand],
   def runCommand(source: Source[MqttMessage, Future[Done]], responseSink: Sink[MqttMessage, _]): Future[Done] = {
     val decider: Supervision.Decider = {
       case e: MqttException => {
-        logger.error(s"Supervision Decider - Resume $e")
+        logger.error("Supervision Decider - Resume", e)
         Supervision.Resume
       }
       case _: RuntimeException => Supervision.Resume
@@ -117,7 +125,19 @@ class MqttRequestStream(tenantService: ActorRef[EdaCommand],
     }
 
     logger.info("Start EDA command listener")
-    source.throttle(5, 1.second)
+    // 261005-ca2: a failed source or response sink (broker unreachable at the first connect, subscribe or
+    // publish failure) is started again with backoff instead of ending the listener. A lost connection does not
+    // fail the stage (automatic reconnect), so a reconnect without re-subscribe is not covered (platform#171).
+    // The returned Future is the first subscription.
+    val restartSettings = RestartSettings(1.second, 30.seconds, 0.2)
+    val firstSubscription = Promise[Done]()
+    RestartSource.onFailuresWithBackoff(restartSettings) { () =>
+      source.mapMaterializedValue { subscribed =>
+        subscribed.failed.foreach(e => logger.warn("EDA command listener: subscription failed, restarting with backoff", e))
+        firstSubscription.completeWith(subscribed) // same as the deprecated tryCompleteWith: a later restart leaves the first result
+        NotUsed
+      }
+    }.throttle(5, 1.second)
       .map(msg => msg.payload.utf8String)
 //      .map(msg => {
 //        println(s"MSG: $msg")
@@ -129,9 +149,10 @@ class MqttRequestStream(tenantService: ActorRef[EdaCommand],
         logger.debug(s"Answer Message to -> ${msg.topic}")
         msg
       })
-      .to(responseSink)
+      .to(RestartSink.withBackoff(restartSettings)(() => responseSink))
       .withAttributes(ActorAttributes.supervisionStrategy(decider))
       .run()
+    firstSubscription.future
   }
 }
 

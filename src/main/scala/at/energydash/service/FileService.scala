@@ -9,10 +9,9 @@ import org.apache.pekko.stream.Materializer
 import org.apache.pekko.stream.scaladsl.Sink
 import org.apache.pekko.util.{ByteString, Timeout}
 import at.energydash.actors.MqttPublisher.{EdaNotification, MqttCommand, MqttPublish}
-import at.energydash.domain.eda.EdaErrorMessage
-import at.energydash.domain.enums.EbMsMessageType
-import at.energydash.domain.{DefaultEbMsMessage, EbMsMessage, XmlParseHandler}
-import com.typesafe.scalalogging.StrictLogging
+import at.energydash.domain.{DefaultEbMsMessage, XmlParseHandler}
+import at.energydash.logging.LogFields
+import org.slf4j.{Logger, LoggerFactory}
 
 import scala.concurrent.Future
 import scala.concurrent.duration.DurationInt
@@ -29,12 +28,13 @@ object FileService {
     new FileServiceImpl(system, mqttPublisher)
 }
 
-class FileServiceImpl(val system: ActorSystem[_], mqttPublisher: ActorRef[MqttCommand])(implicit val mat: Materializer) extends FileService with StrictLogging {
+class FileServiceImpl(val system: ActorSystem[_], mqttPublisher: ActorRef[MqttCommand])(implicit val mat: Materializer) extends FileService {
+  private val logger: Logger = LoggerFactory.getLogger(getClass)
+
 
   import system._
   implicit val timeout: Timeout = Timeout(5.seconds)
   implicit val sched: Scheduler = system.scheduler
-  import ponton.`package`.fromAnySchemaType
 
   implicit def bp2sting(implicit ev: Unmarshaller[String, String]): Unmarshaller[BodyPartEntity, String] = Unmarshaller.withMaterializer { implicit executionContext =>
     implicit mat =>
@@ -49,18 +49,6 @@ class FileServiceImpl(val system: ActorSystem[_], mqttPublisher: ActorRef[MqttCo
 
   private def bodyPart2Xml(body: BodyPart) = bodyPart2String(body).map(scala.xml.XML.loadString)
 
-  private def edaErrorMessage(error: String) = {
-    EdaErrorMessage(EbMsMessage(
-      messageCode = EbMsMessageType.ERROR_MESSAGE,
-      messageCodeVersion = Some("01.00"),
-      conversationId = "1",
-      messageId = None,
-      sender = "",
-      receiver = "",
-      errorMessage = Some(error)
-    ))
-  }
-
   def parseProcessName(processName: String): Option[(String, String)] = {
     val pattern = """([A-Za-z_-]*)(_(\d+\.\d+)){0,1}""".r
     try {
@@ -69,7 +57,7 @@ class FileServiceImpl(val system: ActorSystem[_], mqttPublisher: ActorRef[MqttCo
       Some(protocol, version)
     } catch {
       case e: MatchError =>
-        logger.error(s"Error ProcessInfo: ${e.getMessage()}")
+        logger.error("Error ProcessInfo: not a process name", e)
         Some("ERROR", "")
       case _: Throwable =>
         None
@@ -77,9 +65,10 @@ class FileServiceImpl(val system: ActorSystem[_], mqttPublisher: ActorRef[MqttCo
   }
 
   def handleUpload(formData: Multipart.FormData, ecId: Option[String]): Future[Done] = {
+    val request = LogFields.current() // the stages run on other threads
     formData.parts
       .map(part => FileInfo(part))
-      .map(info => Tuple2(info, parseProcessName(info.processName)))
+      .map(info => Tuple2(info, LogFields.withMdc(request: _*)(parseProcessName(info.processName))))
       .mapAsync(1) {
         case (info, Some(process)) => bodyPart2Xml(info.bodyPart).map(xml => {
           (process._1, XmlParseHandler.mapXmlToEbms(
@@ -90,7 +79,7 @@ class FileServiceImpl(val system: ActorSystem[_], mqttPublisher: ActorRef[MqttCo
 //          }
         })
         case (info, None) =>
-          log.error(s"File not valid ${info.processName}")
+          LogFields.withMdc(request: _*)(log.error(s"File not valid ${info.processName}"))
           Future(("Error", DefaultEbMsMessage.Error("FileUpload", Some("Wrong File"))))
       }
       .map {

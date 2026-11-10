@@ -1,24 +1,16 @@
 package at.energydash.domain.xml
 
 import at.energydash.config.Config
-import at.energydash.domain.eda.MessageHelper.{buildCalendar, buildCalendarDate, getNow, getProcessDate}
+import at.energydash.domain.eda.MessageHelper.{buildCalendarDate, getNow, getProcessDate}
 import at.energydash.domain.enums.{EbMsMessageType, EcDisModelEnum, EcTypeEnum, MeterDirectionType}
 import at.energydash.domain.{EbMsMessage, Meter}
 import ecmplist.v01p10.ECMPList
 import ponton.`package`.{Commontypesv01p20_AddressTypeFormat, Commontypesv01p20_DocumentModeFormat, Ecmplistv01p10_SchemaVersionFormat, __BooleanXMLFormat}
 import scalaxb.Helper
 
-import java.util.{Calendar, Date, GregorianCalendar, Locale}
+import java.util.Date
 
 case class ECMPListV0110Document(doc: ecmplist.v01p10.ECMPList) {
-  private def calcRestrictedDate(dt: Option[Date]): Option[Date] = dt.map(buildCalendar).map(d => {
-      val now = new GregorianCalendar(new Locale("de", "AT"))
-      if (now.get(Calendar.HOUR_OF_DAY) > 16 || now.get(Calendar.HOUR_OF_DAY) < 9) {
-        d.add(Calendar.DAY_OF_MONTH, 1)
-      }
-      d
-    }).map(_.getTime)
-
   def toDoc: ECMPList = doc
 
   def withRestrictedProcessDate(): ECMPListV0110Document = {
@@ -99,7 +91,7 @@ object ECMPListV0110Document {
       RoutingHeader=commontypes.v01p20.RoutingHeader(
         commontypes.v01p20.RoutingAddress(message.sender, Map(("@AddressType", scalaxb.DataRecord[commontypes.v01p20.AddressType](commontypes.v01p20.ECNumber)))),
         commontypes.v01p20.RoutingAddress(message.receiver, Map(("@AddressType", scalaxb.DataRecord[commontypes.v01p20.AddressType](commontypes.v01p20.ECNumber)))),
-        Helper.toCalendar(buildCalendar(new Date))
+        at.energydash.domain.eda.MessageHelper.xmlDateTime(new Date)
       ),
       Sector=commontypes.v01p20.Number01,
       MessageCode=message.messageCode.toString,
@@ -117,11 +109,16 @@ object ECMPListV0110Document {
         ConversationId = message.conversationId,
         ProcessDate = Helper.toCalendar(getProcessDate),
         ECID = message.ecId.get,
+        // no default: a missing type is not sent as RC_L; ECMPList 01p10 has no PP/SC, those need
+        // EC_PRTFACT_CHANGE 01.10 (ECMPList 01p20) (platform#229, E2)
         ECType = message.ecType match {
           case Some(EcTypeEnum.GEA) => ecmplist.v01p10.GC
           case Some(EcTypeEnum.REGIONAL) => ecmplist.v01p10.RC_R
+          case Some(EcTypeEnum.LOCAL) => ecmplist.v01p10.RC_L
           case Some(EcTypeEnum.BEG) => ecmplist.v01p10.CC
-          case _ => ecmplist.v01p10.RC_L
+          case Some(t @ (EcTypeEnum.P2P | EcTypeEnum.EVA)) => throw new IllegalArgumentException(
+            s"${message.messageCode} with ecType $t needs version 01.10 (ECMPList 01p20), not ${message.messageCodeVersion.getOrElse("<none>")}")
+          case other => throw new IllegalArgumentException(s"${message.messageCode} without a known ecType (${other.getOrElse("<none>")})")
         },
         ECDisModel = message.ecDisModel match {
           case Some(EcDisModelEnum.STATIC) => ecmplist.v01p10.S

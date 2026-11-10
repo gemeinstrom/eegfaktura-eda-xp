@@ -1,6 +1,5 @@
 package at.energydash.actors
 
-import org.apache.pekko.actor.typed.scaladsl.AskPattern._
 import org.apache.pekko.actor.typed.scaladsl.Behaviors
 import org.apache.pekko.actor.typed.{ActorRef, Behavior}
 import org.apache.pekko.util.Timeout
@@ -10,6 +9,7 @@ import at.energydash.domain.eda.EdaErrorMessage
 import at.energydash.mailer.EmailService.SendEmailCommand
 import at.energydash.mailer.Fetcher.{ErrorMessage, FetcherContext, MailContent, MailMessage}
 import at.energydash.mailer.{ConfiguredMailer, Fetcher}
+import at.energydash.logging.{LogFields, LogText}
 import org.slf4j.{Logger, LoggerFactory}
 
 import scala.concurrent.ExecutionContext
@@ -26,12 +26,13 @@ class TenantMailActor(tenantConfig: TenantConfig, mailRepo: SlickEmailOutboxRepo
 
   var tenant: String = tenantConfig.tenant
 //  val config: com.typesafe.config.Config = Config.getMailSessionConfig(tenant)
-  private val mailSession = ConfiguredMailer.getSession(tenantConfig)
+  // per worker, from the config it starts with: a changed tenant config starts a new worker (XP-CQ-27)
+  private val mailSession = ConfiguredMailer.createSession(tenantConfig)
 
   implicit val mailContext: FetcherContext = FetcherContext(tenant, mailSession, mailRepo)
 
   def start: Behavior[EmailCommand] = Behaviors.setup[EmailCommand] { context => {
-    import context.{executionContext, system}
+    import context.executionContext
 
     context.setLoggerName(TenantMailActor.getClass)
 
@@ -45,23 +46,20 @@ class TenantMailActor(tenantConfig: TenantConfig, mailRepo: SlickEmailOutboxRepo
     }
 
     def work(): Behavior[EmailCommand] = {
-      Behaviors.withMdc(Map("tenant" -> tenant)) {
+      Behaviors.withMdc(Map(LogFields.TenantId -> tenant)) {
         Behaviors.receiveMessage {
           case req: FetchEmailCommand =>
             req.fetchEmail(req.subject, distributeMail(req))
             Behaviors.same
           case req: SendEmailCommand =>
-            context.log.info(s"Send Mail to ${req.email.toEmail}")
+            context.log.info(s"Send Mail: ${req.email.data.messageCode}, conversation ${req.email.data.conversationId}")
             req.sendEmail(ConfiguredMailer.createMailerFromSession(mailSession)).onComplete {
               case Success(_) =>
-                logger.info(s"Sent Mail to ${req.email.toEmail}")
+                logger.info(s"Sent Mail: ${req.email.data.messageCode}, conversation ${req.email.data.conversationId}")
                 req.replyTo ! SendEdaResponse(req.email.data)
               case Failure(ex) =>
                 req.replyTo ! SendResponseError(tenant, req.email.toEmail, ex.getMessage, "Send Mail")
             }
-            Behaviors.same
-          case req: DeleteEmailCommand =>
-            req.deleteMail()
             Behaviors.same
         }
       }
@@ -71,17 +69,14 @@ class TenantMailActor(tenantConfig: TenantConfig, mailRepo: SlickEmailOutboxRepo
 }
 
 object TenantMailActor {
+  private val fetchLogger: Logger = LoggerFactory.getLogger(classOf[TenantMailActor])
+
   case class FetchEmailCommand(tenant: String, subject: String, replyTo: ActorRef[MqttCommand]) extends EmailCommand {
     def fetchEmail(searchTerm: String, distributeMessage: MailContent => Unit)(implicit ex: ExecutionContext, ctx: FetcherContext): Unit /*Try[List[MailContent]]*/ = {
+      // a failed connect, login or search must be seen, or a MAIL tenant silently stops receiving (XP-CQ-20)
       Try(
         Fetcher().fetch(searchTerm, distributeMessage)
-      )
-    }
-  }
-
-  case class DeleteEmailCommand(tenant: String, messageId: String) extends EmailCommand {
-    def deleteMail()(implicit ctx: FetcherContext): Unit = {
-      Fetcher().deleteById(messageId)
+      ).failed.foreach(e => fetchLogger.error(s"Fetching mails failed: ${LogText.exceptionText(e.getClass.getName, e.getMessage)}", e))
     }
   }
 

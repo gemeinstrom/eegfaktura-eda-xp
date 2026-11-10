@@ -1,8 +1,9 @@
 package at.energydash.domain.eda
 
 import at.energydash.domain.{EbMsMessage, Meter, XmlParseHandler}
-import at.energydash.domain.eda.MessageHelper.getProcessDate
+import at.energydash.domain.eda.MessageHelper.{getNow, getProcessDate}
 import at.energydash.domain.enums.{EbMsMessageType, MeterDirectionType}
+import org.scalatest.{EitherValues, TryValues}
 import org.scalatest.matchers.should.Matchers
 import org.scalatest.wordspec.AnyWordSpecLike
 import io.circe.generic.auto._
@@ -10,7 +11,7 @@ import io.circe.parser.decode
 
 import scala.io.Source
 
-class CMRequestOfflineRegistrationSpec extends AnyWordSpecLike with Matchers {
+class CMRequestOfflineRegistrationSpec extends AnyWordSpecLike with Matchers with EitherValues with TryValues {
   import at.energydash.domain.JsonImplicit._
 
   "Registration Online Message" should {
@@ -23,16 +24,14 @@ class CMRequestOfflineRegistrationSpec extends AnyWordSpecLike with Matchers {
         sender = "RC100130", receiver = "AT003000", messageCode = EbMsMessageType.OFFLINE_REG_INIT, messageCodeVersion = Some("02.00"),
         meter = Some(Meter("AT0030000000000000000000000655856", Some(MeterDirectionType.CONSUMPTION))), ecId = Some("AT00300000000RC100181000000956509"))
 
-      val m = CMRequestOfflineRegistration(testMessage).getVersion()
       val node = CMRequestOfflineRegistration(testMessage).getVersion().map(_.toXML).get
 
       (node \ "MarketParticipantDirectory" \ "MessageCode").text shouldBe EbMsMessageType.OFFLINE_REG_INIT.toString
       (node \ "ProcessDirectory" \ "MeteringPoint").text shouldBe "AT0030000000000000000000000655856"
       (node \ "ProcessDirectory" \ "CMRequest" \ "ECID").text shouldBe "AT00300000000RC100181000000956509"
       (node \ "ProcessDirectory" \ "CMRequest" \ "EnergyDirection").text shouldBe MeterDirectionType.CONSUMPTION.toString
-      (node \ "ProcessDirectory" \ "ProcessDate").text shouldBe getProcessDate
+      (node \ "ProcessDirectory" \ "ProcessDate").text should (equal(getNow().toString) or equal(getProcessDate)) // tomorrow; today if the run crossed midnight
 
-      println(m.map(_.toRecord).get)
     }
 
     "build 02.10 XML File" in {
@@ -50,7 +49,7 @@ class CMRequestOfflineRegistrationSpec extends AnyWordSpecLike with Matchers {
       (node \ "ProcessDirectory" \ "MeteringPoint").text shouldBe "AT0030000000000000000000000655856"
       (node \ "ProcessDirectory" \ "CMRequest" \ "ECID").text shouldBe "AT00300000000RC100181000000956509"
       (node \ "ProcessDirectory" \ "CMRequest" \ "EnergyDirection").text shouldBe MeterDirectionType.CONSUMPTION.toString
-      (node \ "ProcessDirectory" \ "ProcessDate").text shouldBe getProcessDate
+      (node \ "ProcessDirectory" \ "ProcessDate").text should (equal(getNow().toString) or equal(getProcessDate)) // tomorrow; today if the run crossed midnight
     }
 
     "build version 02.30 from eda message" in {
@@ -73,12 +72,7 @@ class CMRequestOfflineRegistrationSpec extends AnyWordSpecLike with Matchers {
 
       val message = decode[EbMsMessage](edaMessage)
 
-      val nodeClass = message match {
-        case Right(m) => CMRequestOfflineRegistration(m).getVersion()
-      }
-
-      val record = nodeClass.map(_.toRecord).get
-      println(record)
+      noException should be thrownBy CMRequestOfflineRegistration(message.value).getVersion().success.value.toRecord
     }
 
     "build from JsonFile" in {
@@ -86,16 +80,13 @@ class CMRequestOfflineRegistrationSpec extends AnyWordSpecLike with Matchers {
 
       val message = decode[EbMsMessage](testMessage)
 
-      val node = message match {
-        case Right(m) => CMRequestRegistrationOnlineXMLMessageV0200(m).toXML
-      }
+      val node = CMRequestRegistrationOnlineXMLMessageV0200(message.value).toXML
 
       (node \ "MarketParticipantDirectory" \ "MessageCode").text shouldBe EbMsMessageType.ONLINE_REG_INIT.toString
       (node \ "ProcessDirectory" \ "MeteringPoint").text shouldBe "AT0030000000000000000000000179843"
       (node \ "ProcessDirectory" \ "CMRequest" \ "ECID").text shouldBe "AT00300000000RC102728000000972173"
       (node \ "ProcessDirectory" \ "CMRequest" \ "EnergyDirection").text shouldBe MeterDirectionType.CONSUMPTION.toString
 
-      println(node)
     }
   }
 
@@ -140,15 +131,54 @@ class CMRequestOfflineRegistrationSpec extends AnyWordSpecLike with Matchers {
 
       val message = decode[EbMsMessage](jsonObjectStr)
 
-      val node = message match {
-        case Right(m) => CMRequestRegistrationOnlineXMLMessageV0200(m).toXML
-      }
+      val node = CMRequestRegistrationOnlineXMLMessageV0200(message.value).toXML
       (node \\ "ECPartFact").text shouldBe "90"
       (node \\ "ProcessDirectory" \ "MeteringPoint").text shouldBe "AT0020000000000000000000020901971"
-      println(node)
     }
   }
 
+  "ECOF — Versionskennung 02.20 (cmrequest 01p30)" in {
+    val msg = EbMsMessage(
+      conversationId = "AT003000202310051506076450000003761",
+      requestId = Some("5JWLV5Z3"),
+      messageId = Some("RC100130202310051506080740000003762"),
+      sender = "RC100130", receiver = "AT003000", messageCode = EbMsMessageType.OFFLINE_REG_INIT, messageCodeVersion = Some("02.20"),
+      meter = Some(Meter("AT0030000000000000000000000655856", Some(MeterDirectionType.CONSUMPTION))), ecId = Some("AT00300000000RC100130000000952832"))
+
+    val xml = CMRequestOfflineRegistration(msg).getVersion().get
+    xml.schemaLocation.get should include("cmrequest/01p30")
+    xml.schemaLocation.get should endWith("customerprocesses/EC_REQ_OFF/02.20/ANFORDERUNG_ECOF")
+    val node = xml.toXML
+    node.namespace shouldBe "http://www.ebutilities.at/schemata/customerconsent/cmrequest/01p30"
+    (node \ "MarketParticipantDirectory" \ "@SchemaVersion").text shouldBe "01.30"
+    (node \ "MarketParticipantDirectory" \ "MessageCode").text shouldBe EbMsMessageType.OFFLINE_REG_INIT.toString
+  }
+
+  "ECOF — Versionskennung 02.30 (cmrequest 01p30)" in {
+    val msg = EbMsMessage(
+      conversationId = "AT003000202310051506076450000003761",
+      requestId = Some("5JWLV5Z3"),
+      messageId = Some("RC100130202310051506080740000003762"),
+      sender = "RC100130", receiver = "AT003000", messageCode = EbMsMessageType.OFFLINE_REG_INIT, messageCodeVersion = Some("02.30"),
+      meter = Some(Meter("AT0030000000000000000000000655856", Some(MeterDirectionType.CONSUMPTION))), ecId = Some("AT00300000000RC100130000000952832"))
+
+    val xml = CMRequestOfflineRegistration(msg).getVersion().get
+    xml.schemaLocation.get should include("cmrequest/01p30")
+    xml.schemaLocation.get should endWith("customerprocesses/EC_REQ_OFF/02.30/ANFORDERUNG_ECOF")
+    val node = xml.toXML
+    node.namespace shouldBe "http://www.ebutilities.at/schemata/customerconsent/cmrequest/01p30"
+    (node \ "MarketParticipantDirectory" \ "@SchemaVersion").text shouldBe "01.30"
+    (node \ "MarketParticipantDirectory" \ "MessageCode").text shouldBe EbMsMessageType.OFFLINE_REG_INIT.toString
+  }
+
+  "ECOF — Prozessversion 03.00 ist kein Schema-Set-Label und wird nicht gebaut" in {
+    val msg = EbMsMessage(
+      conversationId = "AT003000202310051506076450000003761",
+      requestId = Some("5JWLV5Z3"),
+      messageId = Some("RC100130202310051506080740000003762"),
+      sender = "RC100130", receiver = "AT003000", messageCode = EbMsMessageType.OFFLINE_REG_INIT, messageCodeVersion = Some("03.00"),
+      meter = Some(Meter("AT0030000000000000000000000655856", Some(MeterDirectionType.CONSUMPTION))), ecId = Some("AT00300000000RC100130000000952832"))
+
+    CMRequestOfflineRegistration(msg).getVersion().isFailure shouldBe true
+  }
 }
-
-

@@ -1,7 +1,7 @@
 package at.energydash.domain.xml
 
 import at.energydash.config.Config
-import at.energydash.domain.eda.MessageHelper.{buildCalendar, buildCalendarDate}
+import at.energydash.domain.eda.MessageHelper.buildCalendarDate
 import at.energydash.domain.enums.EbMsMessageType
 import at.energydash.domain.{EbMsMessage, ResponseData}
 import cmrevoke.v01p10._
@@ -39,7 +39,7 @@ object CMRevokeV0110Document {
       RoutingHeader = RoutingHeader(
         Sender = RoutingAddress(message.sender, Map(("@AddressType", scalaxb.DataRecord[AddressType](ECNumber)))),
         Receiver = RoutingAddress(message.receiver, Map(("@AddressType", scalaxb.DataRecord[AddressType](ECNumber)))),
-        DocumentCreationDateTime = Helper.toCalendar(buildCalendar(new Date))
+        DocumentCreationDateTime = at.energydash.domain.eda.MessageHelper.xmlDateTime(new Date)
       ),
       Sector = Number01,
       MessageCode = message.messageCode.toString,

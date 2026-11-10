@@ -6,7 +6,7 @@ import org.apache.pekko.actor.typed.ActorSystem
 import at.energydash.actors.PontonService.buildMessageId
 import at.energydash.domain.EbMsMessage
 import at.energydash.domain.eda.MessageHelper
-import at.energydash.domain.eda.MessageHelper.EDAMessageCodeToProcessCode
+import at.energydash.domain.eda.MessageHelper.pontonHeaderMessageType
 import ponton.OutHeaderType
 import ponton.`package`.__NodeXMLFormat
 import scalaxb.{DataRecord, HttpClientsAsync, Soap11ClientsAsync}
@@ -32,15 +32,15 @@ trait OutboundDocument4SOAPBindings {
         Nil, scope, baseAddress, "POST", Some(new java.net.URI("http://xp.ponton.de/eda/v320/outboundDocument"))).map({ case x => () })
 
     def sendRequest(edaMessage: EbMsMessage)(implicit ec: ExecutionContext): Future[Envelope] /*Future[(scala.xml.NodeSeq, scala.xml.NodeSeq)]*/ = {
-      MessageHelper.getEdaMessageByType(edaMessage) match {
-        case Some(xmlObj) =>
+      MessageHelper.getEdaMessageByTypeTry(edaMessage) match {
+        case scala.util.Success(xmlObj) =>
           try {
             val header = OutHeaderType(
               MessageId = buildMessageId(edaMessage.sender, edaMessage.seqNr.getOrElse(10000)),
               SenderId = edaMessage.sender,
               ReceiverId = edaMessage.receiver,
               MessageVersion = edaMessage.messageCodeVersion.getOrElse("01.00"),
-              MessageType = EDAMessageCodeToProcessCode(edaMessage.messageCode).toString,
+              MessageType = pontonHeaderMessageType(edaMessage.messageCode),
               LogInfo = Some("VFEEG-OUT"))
             val body = ponton.OutboundMessage(outboundmessageoption = xmlObj.toRecord)
 
@@ -64,7 +64,7 @@ trait OutboundDocument4SOAPBindings {
           catch {
             case e: Throwable => Future(throw e)
           }
-        case None => Future(throw new RuntimeException(s"No XML mapping for message type ${edaMessage.messageCode}"))
+        case scala.util.Failure(e) => Future.failed(e)
       }
     }
   }
