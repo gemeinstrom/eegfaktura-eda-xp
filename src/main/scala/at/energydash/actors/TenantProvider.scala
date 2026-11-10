@@ -11,7 +11,7 @@ import io.circe.parser._
 import org.slf4j.{Logger, LoggerFactory}
 
 import scala.concurrent.Future
-import scala.concurrent.duration.DurationInt
+import scala.concurrent.duration.{DurationInt, DurationLong, FiniteDuration}
 import scala.util.{Failure, Success, Try}
 
 class TenantProvider(mqttPublisher: ActorRef[MqttCommand]) {
@@ -19,11 +19,11 @@ class TenantProvider(mqttPublisher: ActorRef[MqttCommand]) {
   import TenantProvider._
   var logger: Logger = LoggerFactory.getLogger(classOf[TenantProvider])
 
-  def start: Behavior[EdaCommand] = Behaviors.setup[EdaCommand] { context => {
+  def start: Behavior[EdaCommand] = Behaviors.withStash[EdaCommand](StashCapacity) { buffer => Behaviors.withTimers[EdaCommand] { timers => Behaviors.setup[EdaCommand] { context => {
 
     import context.executionContext
 
-    val dbConfig = Db.getConfig
+    val dbConfig = Db.config
     val mailRepo = new SlickEmailOutboxRepository(dbConfig)
     val tenantConfigRepository = new SlickTenantConfigRepository(dbConfig)
 
@@ -33,6 +33,31 @@ class TenantProvider(mqttPublisher: ActorRef[MqttCommand]) {
         .onFailure[Exception](SupervisorStrategy.restart),
       name = "worker-ponton-messenager"
     )
+
+    // suffix of the mail worker names (261005-ca3): a replaced worker stops asynchronously after
+    // GracefulShutdown, so its name may still be taken when the new one is spawned
+    var workerSeq = 0
+
+    def spawnMailWorker(t: TenantConfig): ActorRef[EdaCommand] = {
+      workerSeq += 1
+      context.spawn(
+        Behaviors.supervise(
+          FetchMailTenantWorker(t, mqttPublisher, mailRepo)
+        ).onFailure[Exception](SupervisorStrategy.restart),
+        s"worker-${t.tenant}-$workerSeq"
+      )
+    }
+
+    // a replaced or reloaded mail worker must stop, or two workers poll the same mailbox (261005-ca3)
+    def shutdownWorker(a: ActorRef[EdaCommand]): Unit =
+      if (a.compareTo(pontonMessager) != 0) {
+        try {
+          a ! GracefulShutdown
+        } catch {
+          case e: Exception =>
+            logger.warn("Error sending shutdown to tenant actor", e)
+        }
+      }
 
     // Async initialization: Load tenants without blocking
 //    def initializeTenants(): Future[Try[Map[String, ActorRef[EdaCommand]]]] = {
@@ -64,7 +89,7 @@ class TenantProvider(mqttPublisher: ActorRef[MqttCommand]) {
       tenantConfigRepository.allActivated(Config.superviseType)
         .map(Success(_))
         .recover { case e =>
-          logger.error(s"Failed to load tenant configuration: ${e.getMessage}", e)
+          logger.error("Failed to load tenant configuration", e)
           Failure(e)
         }
     }
@@ -86,7 +111,12 @@ class TenantProvider(mqttPublisher: ActorRef[MqttCommand]) {
           }
 
           // Return waiting behavior that queues incoming messages
-          waitingForInitialization(messageQueue = Vector.empty)
+          waitingForInitialization()
+
+        // after a supervisor restart requests arrive before the TenantStart the provider sends itself (261005-ca3)
+        case msg @ (_: PassEdaCommand | _: AddTenant | _: UpdateTenant) =>
+          logger.debug(s"Queuing ${msg.getClass.getSimpleName} (initialization not started yet)")
+          queue(msg)
 
         case other =>
           logger.warn(s"Received message ${other.getClass.getSimpleName} before initialization started")
@@ -94,8 +124,18 @@ class TenantProvider(mqttPublisher: ActorRef[MqttCommand]) {
       }
     }
 
+    // Queue a message until initialization is complete; replayed in arrival order by unstashAll
+    def queue(msg: EdaCommand): Behavior[EdaCommand] = {
+      if (buffer.isFull) {
+        logger.warn(s"Discarding message ${msg.getClass.getSimpleName} during initialization, queue full (${buffer.capacity})")
+      } else {
+        buffer.stash(msg)
+      }
+      Behaviors.same
+    }
+
     // Behavior while waiting for initialization to complete
-    def waitingForInitialization(messageQueue: Vector[EdaCommand]): Behavior[EdaCommand] = {
+    def waitingForInitialization(): Behavior[EdaCommand] = {
       Behaviors.receiveMessage {
         case InitializationSuccess(tenantConfigs) =>
           val tenantActors = tenantConfigs.flatMap { t =>
@@ -105,13 +145,14 @@ class TenantProvider(mqttPublisher: ActorRef[MqttCommand]) {
                 Some(t.tenant.toUpperCase -> pontonMessager)
 
               case "MAIL" =>
-                val mailWorker = context.spawn(
-                  Behaviors.supervise(
-                    FetchMailTenantWorker(t, mqttPublisher, mailRepo)
-                  ).onFailure[Exception](SupervisorStrategy.restart),
-                  s"worker-${t.tenant}"
-                )
-                Some(t.tenant.toUpperCase -> mailWorker)
+                // a tenant whose worker cannot be spawned (e.g. a character not allowed in an actor name) is
+                // left out instead of failing the provider and losing the queued messages (261005-ca3)
+                Try(spawnMailWorker(t)) match {
+                  case Success(mailWorker) => Some(t.tenant.toUpperCase -> mailWorker)
+                  case Failure(e) =>
+                    logger.error(s"Tenant ${t.tenant}: mail worker not started", e)
+                    None
+                }
 
               case _ =>
                 logger.warn(s"Tenant ${t.tenant} has no type definition.")
@@ -119,40 +160,66 @@ class TenantProvider(mqttPublisher: ActorRef[MqttCommand]) {
             }
           }.toMap
 
-          logger.info(s"Initialization completed with ${tenantActors.size} tenants")
+          logger.info(s"Initialization completed with ${tenantActors.size} tenants, ${buffer.size} queued messages")
 
-          // Process queued messages and transition to provide state
-          val provideBehavior = provide(tenantActors)
-          messageQueue.foldLeft(provideBehavior) { (behavior, msg) =>
-            // Reprocess queued messages
-            behavior
-          }
-          provideBehavior
+          // Process queued messages in arrival order and transition to provide state
+          buffer.unstashAll(provide(tenantActors))
 
         case InitializationFailure(exception) =>
           logger.error(
-            s"Initialization failed: ${exception.getMessage}. Retrying in 5 seconds...",
+            "Initialization failed. Retrying in 5 seconds...",
             exception
           )
-          context.scheduleOnce(5.seconds, context.self, TenantStart)
+          // a timer, not scheduleOnce: a restart cancels it, so no stale TenantStart reaches the next incarnation
+          timers.startSingleTimer(TenantStart, 5.seconds)
           // Keep queuing messages
+          Behaviors.same
+
+        // The retry scheduled above: load again, keep queuing (was discarded below, the provider never left this state)
+        case TenantStart =>
+          logger.info("Retrying tenant initialization")
+          context.pipeToSelf(initializeTenants()) {
+            case Success(Success(configs)) =>
+              InitializationSuccess(configs)
+            case Success(Failure(e)) =>
+              InitializationFailure(e)
+            case Failure(e) =>
+              InitializationFailure(e)
+          }
           Behaviors.same
 
         case msg: PassEdaCommand =>
           logger.debug(s"Queuing message for tenant ${msg.tenant} (initialization in progress)")
-          waitingForInitialization(messageQueue :+ msg)
+          queue(msg)
 
         case msg: AddTenant =>
           logger.debug("Queuing AddTenant message (initialization in progress)")
-          waitingForInitialization(messageQueue :+ msg)
+          queue(msg)
 
         case msg: UpdateTenant =>
           logger.debug("Queuing UpdateTenant message (initialization in progress)")
-          waitingForInitialization(messageQueue :+ msg)
+          queue(msg)
 
         case msg =>
           logger.warn(s"Discarding message ${msg.getClass.getSimpleName} during initialization")
           Behaviors.same
+      }
+    }
+
+    // Pass a request to the tenant's worker
+    def pass(tenantActors: Map[String, ActorRef[EdaCommand]], cmd: PassEdaCommand): Unit = {
+      val PassEdaCommand(tenant, message, replyTo, _) = cmd
+      try {
+        tenantActors.get(tenant.toUpperCase()) match {
+          case Some(a) => a ! SendEdaCommand(message, replyTo)
+          case None =>
+            logger.warn(s"Tenant not registered: $tenant")
+            replyTo ! SendResponseError(tenant, message.receiver, "Tenant not registered")
+        }
+      } catch {
+        case e: Exception =>
+          logger.error("Error passing command to tenant", e)
+          replyTo ! SendResponseError(tenant, message.receiver, s"Internal error: ${e.getMessage}")
       }
     }
 
@@ -161,19 +228,14 @@ class TenantProvider(mqttPublisher: ActorRef[MqttCommand]) {
       logger.info(s"Tenant Actor ready with tenants: ${tenantActors.keys.mkString(", ")}")
 
       Behaviors.receiveMessage {
-        case PassEdaCommand(tenant, message, replyTo) =>
-          try {
-            tenantActors.get(tenant.toUpperCase()) match {
-              case Some(a) => a ! SendEdaCommand(message, replyTo)
-              case None =>
-                logger.warn(s"Tenant not registered: $tenant")
-                replyTo ! SendResponseError(tenant, message.receiver, "Tenant not registered")
-            }
-          } catch {
-            case e: Exception =>
-              logger.error(s"Error passing command to tenant: ${e.getMessage}", e)
-              replyTo ! SendResponseError(tenant, message.receiver, s"Internal error: ${e.getMessage}")
-          }
+        // a request whose caller has given up (ask timeout) is answered with an error, never sent (261005-ca3);
+        // its age counts from its creation, so also the time it waited in a restart or the initialization
+        case cmd: PassEdaCommand =>
+          val age = (System.nanoTime() - cmd.createdAt).nanos
+          if (age > QueuedRequestLimit) {
+            logger.warn(s"Request for tenant ${cmd.tenant} (${cmd.message.messageCode}) is ${age.toSeconds} s old: not sent")
+            cmd.replyTo ! SendResponseError(cmd.tenant, cmd.message.receiver, "Request expired during the tenant initialization")
+          } else pass(tenantActors, cmd)
           Behaviors.same
 
         case AddTenant(tenantConfig, replyTo) =>
@@ -182,7 +244,7 @@ class TenantProvider(mqttPublisher: ActorRef[MqttCommand]) {
             case Success(_) =>
               context.self ! TenantModified(tenantConfig, replyTo)
             case Failure(e) =>
-              logger.error(s"Failed to add tenant ${tenantConfig.tenant}: ${e.getMessage}", e)
+              logger.error(s"Failed to add tenant ${tenantConfig.tenant}", e)
               replyTo ! ResponseError(e.getMessage)
           }
           Behaviors.same
@@ -193,57 +255,55 @@ class TenantProvider(mqttPublisher: ActorRef[MqttCommand]) {
             case Success(_) =>
               context.self ! TenantModified(tenantConfig, replyTo)
             case Failure(e) =>
-              logger.error(s"Update Tenant failed for ${tenantConfig.tenant}: ${e.getMessage}", e)
+              logger.error(s"Update Tenant failed for ${tenantConfig.tenant}", e)
               replyTo ! ResponseError(e.getMessage)
           }
           Behaviors.same
 
         case TenantModified(tenantConfig, replyTo) =>
           logger.info(s"Tenant modified: ${tenantConfig.tenant}")
-          replyTo ! ResponseOk()
 
-          // Publish tenant state with error handling
-          parse(s"""{"online": true}""") match {
-            case Right(json) =>
-              mqttPublisher ! MqttPublishCommand(
-                CommandMessage(tenantConfig.tenant, "pontonOnlineState", json)
-              )
-            case Left(e) =>
-              logger.error(
-                s"Failed to parse MQTT message for tenant ${tenantConfig.tenant}: ${e.message}"
-              )
-          }
-
-          // Gracefully shutdown old actor reference
-          tenantActors.get(tenantConfig.tenant.toUpperCase()).foreach(a => {
-            if (a.compareTo(pontonMessager) != 0) {
-              try {
-                a ! GracefulShutdown
-              } catch {
-                case e: Exception =>
-                  logger.warn(s"Error sending shutdown to tenant actor: ${e.getMessage}")
-              }
-            }
-          })
-
-          // Recreate tenant with updated configuration
-          val updatedActor = tenantConfig.cType.toUpperCase match {
+          // Recreate tenant with updated configuration first: a worker that cannot be spawned (e.g. a character
+          // not allowed in an actor name) is answered with an error instead of failing the provider after the
+          // caller was told it worked (261005-ca3)
+          val updated: Try[ActorRef[EdaCommand]] = tenantConfig.cType.toUpperCase match {
             case "KEP" =>
-              pontonMessager
+              Success(pontonMessager)
             case _ =>
-              context.spawn(
-                Behaviors.supervise(
-                  FetchMailTenantWorker(tenantConfig, mqttPublisher, mailRepo)
-                ).onFailure[Exception](SupervisorStrategy.restart),
-                s"worker-${tenantConfig.tenant}"
-              )
+              Try(spawnMailWorker(tenantConfig))
           }
 
-          provide(tenantActors + (tenantConfig.tenant.toUpperCase() -> updatedActor))
+          updated match {
+            case Failure(e) =>
+              logger.error(s"Tenant ${tenantConfig.tenant}: worker not started", e)
+              replyTo ! ResponseError(s"Tenant worker not started: ${e.getMessage}")
+              Behaviors.same
+
+            case Success(updatedActor) =>
+              replyTo ! ResponseOk()
+
+              // Publish tenant state with error handling
+              parse(s"""{"online": true}""") match {
+                case Right(json) =>
+                  mqttPublisher ! MqttPublishCommand(
+                    CommandMessage(tenantConfig.tenant, "pontonOnlineState", json)
+                  )
+                case Left(e) =>
+                  logger.error(
+                    s"Failed to parse MQTT message for tenant ${tenantConfig.tenant}", e
+                  )
+              }
+
+              // Gracefully shutdown old actor reference
+              tenantActors.get(tenantConfig.tenant.toUpperCase()).foreach(shutdownWorker)
+
+              provide(tenantActors + (tenantConfig.tenant.toUpperCase() -> updatedActor))
+          }
 
         case TenantStart =>
-          // Reinitialize if needed
+          // Reinitialize if needed; the reload spawns new mail workers, so the current ones stop
           logger.warn("Restarting tenant initialization")
+          tenantActors.values.foreach(shutdownWorker)
           context.pipeToSelf(initializeTenants()) {
             case Success(Success(updatedTenants)) =>
               InitializationSuccess(updatedTenants)
@@ -252,7 +312,7 @@ class TenantProvider(mqttPublisher: ActorRef[MqttCommand]) {
             case Failure(e) =>
               InitializationFailure(e)
           }
-          waitingForInitialization(messageQueue = Vector.empty)
+          waitingForInitialization()
 
         case msg: InitializationSuccess =>
           logger.warn(s"Received InitializationSuccess during normal operation, ignoring")
@@ -265,10 +325,13 @@ class TenantProvider(mqttPublisher: ActorRef[MqttCommand]) {
     }
 
     initializing()
-  }}
+  }}}}
 }
 
 object TenantProvider {
+
+  // messages queued while the tenants are loaded; more are discarded with a warning
+  private val StashCapacity = 1000
 
   // ===== Public Messages =====
   case object TenantStart extends EdaCommand
@@ -280,6 +343,21 @@ object TenantProvider {
   private case class InitializationFailure(exception: Throwable)
     extends EdaCommand
 
+  /** How long the request stream waits for the answer to a PassEdaCommand. */
+  val PassAskTimeout: FiniteDuration = 30.seconds
+
+  /** A request older than this is not sent any more: its caller gives up after PassAskTimeout (261005-ca3). */
+  val QueuedRequestLimit: FiniteDuration = PassAskTimeout - 5.seconds
+
   def apply(mqttPublisher: ActorRef[MqttCommand]): Behavior[EdaCommand] =
     new TenantProvider(mqttPublisher).start
+
+  /** The provider as the service runs it (261005-ca3): restarted with backoff when it fails, and it starts its
+   *  own initialisation, so a restart loads the tenants again. `provider` is replaceable for tests. */
+  def supervised(mqttPublisher: ActorRef[MqttCommand],
+                 provider: ActorRef[MqttCommand] => Behavior[EdaCommand] = p => apply(p)): Behavior[EdaCommand] =
+    Behaviors.supervise(Behaviors.setup[EdaCommand] { context =>
+      context.self ! TenantStart
+      provider(mqttPublisher)
+    }).onFailure[Exception](SupervisorStrategy.restartWithBackoff(1.second, 30.seconds, 0.2))
 }

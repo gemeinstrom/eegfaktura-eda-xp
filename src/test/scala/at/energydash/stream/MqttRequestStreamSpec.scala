@@ -3,6 +3,7 @@ package at.energydash.stream
 import org.apache.pekko.Done
 import org.apache.pekko.stream.connectors.mqtt.scaladsl.MqttSource
 import org.apache.pekko.stream.connectors.mqtt.{MqttConnectionSettings, MqttMessage, MqttQoS, MqttSubscriptions}
+import org.apache.pekko.stream.KillSwitches
 import org.apache.pekko.stream.scaladsl.Source
 import org.apache.pekko.stream.testkit.scaladsl.TestSink
 import at.energydash.MqttSourceSpec.fixture
@@ -11,6 +12,7 @@ import at.energydash.actors.PrepareMessageActor.{PrepareMessage, Prepared}
 import at.energydash.actors._
 import at.energydash.domain.EbMsMessage
 import at.energydash.domain.enums.EbMsMessageType
+import at.energydash.testsupport.LogCapture
 import at.energydash.{EmbeddedDb, MqttBaseSpec}
 import io.circe.generic.auto._
 import io.circe.syntax.{EncoderOps, _}
@@ -46,23 +48,24 @@ class MqttRequestStreamSpec extends MqttBaseSpec with EmbeddedDb with AnyWordSpe
 
       val stream = new MqttRequestStream(edaActorProbe.ref, transformerActorProbe.ref, storeActorProbe.ref)(f.system)
       val (probe, sink) = TestSink[MqttMessage]()(f.system.classicSystem).preMaterialize()
-      val ready = stream.runCommand(mqttSource, sink)
-      whenReady(ready) { _ =>
+      val stop = KillSwitches.shared("request-stream-spec")
+      val ready = stream.runCommand(mqttSource.via(stop.flow), sink)
+      try whenReady(ready) { _ =>
         publish(topic, testMsg)
 
         probe.request(1)
         val msg = transformerActorProbe.expectMessageType[PrepareMessage]
         msg.replyTo ! Prepared(msg.message)
 
+        // the conversation is stored before the message is sent (ca6)
+        val s = storeActorProbe.expectMessageType[InitConversation]
+        s.replyTo ! InitDone(s.message)
+
         val edaCommand = edaActorProbe.expectMessageType[PassEdaCommand]
         edaCommand.replyTo ! SendEdaResponse(edaCommand.message)
 
-        val s = storeActorProbe.expectMessageType[InitConversation]
-        s.replyTo ! InitDone(s.message)
-        println("finish")
-
         probe.requestNext().topic shouldBe "eda/response/myeeg-kep/protocol/ec_req_onl"
-      }
+      } finally stop.shutdown() // runCommand restarts its source: the stream must not outlive the case
     }
 
     "Handle Mqtt message for TYPE EMAIL" in withBroker(Map("topic1" -> 0)) { p =>
@@ -88,8 +91,9 @@ class MqttRequestStreamSpec extends MqttBaseSpec with EmbeddedDb with AnyWordSpe
 
       val stream = new MqttRequestStream(edaActorProbe.ref, transformerActorProbe.ref, storeActorProbe.ref)(f.system)
       val (probe, sink) = TestSink[MqttMessage]()(f.system.classicSystem).preMaterialize()
-      val ready = stream.runCommand(mqttSource, sink)
-      whenReady(ready) { _ =>
+      val stop = KillSwitches.shared("request-stream-spec")
+      val ready = stream.runCommand(mqttSource.via(stop.flow), sink)
+      try whenReady(ready) { _ =>
         publish(topic, testMsg)
 
         probe.request(1)
@@ -97,16 +101,16 @@ class MqttRequestStreamSpec extends MqttBaseSpec with EmbeddedDb with AnyWordSpe
         val msg = transformerActorProbe.expectMessageType[PrepareMessage]
         msg.replyTo ! Prepared(msg.message)
 
+        // the conversation is stored before the message is sent (ca6)
+        val s = storeActorProbe.expectMessageType[InitConversation]
+        s.replyTo ! InitDone(s.message)
+
         val edaCommand = edaActorProbe.expectMessageType[PassEdaCommand]
         edaCommand.replyTo ! SendEdaResponse(edaCommand.message)
 
-        val s = storeActorProbe.expectMessageType[InitConversation]
-        s.replyTo ! InitDone(s.message)
-        println("finish")
-
         probe.requestNext().topic shouldBe "eda/response/myeeg/protocol/ec_req_onl"
 
-      }
+      } finally stop.shutdown() // runCommand restarts its source: the stream must not outlive the case
     }
 
     "Handle malformed Mqtt message" in withBroker(Map("topic1" -> 0)) { p =>
@@ -132,18 +136,21 @@ class MqttRequestStreamSpec extends MqttBaseSpec with EmbeddedDb with AnyWordSpe
 
       val stream = new MqttRequestStream(edaActorProbe.ref, transformerActorProbe.ref, storeActorProbe.ref)(f.system)
       val (probe, sink) = TestSink[MqttMessage]()(f.system.classicSystem).preMaterialize()
-      val ready = stream.runCommand(mqttSource, sink)
-      whenReady(ready) { _ =>
+      val stop = KillSwitches.shared("request-stream-spec")
+      val ready = stream.runCommand(mqttSource.via(stop.flow), sink)
+      try whenReady(ready) { _ =>
         publish(topic, testMsg)
 
         probe.request(1)
         val msg = transformerActorProbe.expectMessageType[PrepareMessage]
         msg.replyTo ! Prepared(msg.message)
 
+        val s = storeActorProbe.expectMessageType[InitConversation]
+        s.replyTo ! InitDone(s.message)
+
         val edaCommand = edaActorProbe.expectMessageType[PassEdaCommand]
         edaCommand.replyTo ! SendResponseError("myeeg", "netz linz", "Local address contains control or whitespace", "Send Mail")
 
-        println("finish")
 
         val expectedPayload = EbMsMessage(
           conversationId = "0", sender = "myeeg", receiver = "netz linz",
@@ -154,7 +161,7 @@ class MqttRequestStreamSpec extends MqttBaseSpec with EmbeddedDb with AnyWordSpe
         val testResponse = probe.requestNext()
         testResponse.topic shouldBe "eda/response/myeeg/protocol/error"
         testResponse.payload.utf8String shouldBe expectedPayload
-      }
+      } finally stop.shutdown() // runCommand restarts its source: the stream must not outlive the case
     }
 
     "Handle malformed EDA message" in withBroker(Map("topic1" -> 0)) { p =>
@@ -180,29 +187,41 @@ class MqttRequestStreamSpec extends MqttBaseSpec with EmbeddedDb with AnyWordSpe
 
       val stream = new MqttRequestStream(edaActorProbe.ref, transformerActorProbe.ref, storeActorProbe.ref)(f.system)
       val (probe, sink) = TestSink[MqttMessage]()(f.system.classicSystem).preMaterialize()
-      val ready = stream.runCommand(mqttSource, sink)
-      whenReady(ready) { _ =>
-        publish(topic, testMsg)
+      val stop = KillSwitches.shared("request-stream-spec")
+      val ready = stream.runCommand(mqttSource.via(stop.flow), sink)
+      // 261005-ca14: the error line names the error, never the request (metering point, ecId)
+      val (_, events) = LogCapture("at.energydash.stream.MqttRequestStream") {
+        try whenReady(ready) { _ =>
+          publish(topic, testMsg)
 
-        probe.request(1)
-        val msg = transformerActorProbe.expectMessageType[PrepareMessage]
-        msg.replyTo ! Prepared(msg.message)
+          probe.request(1)
+          val msg = transformerActorProbe.expectMessageType[PrepareMessage]
+          msg.replyTo ! Prepared(msg.message)
 
-        val edaCommand = edaActorProbe.expectMessageType[PassEdaCommand]
-        edaCommand.replyTo ! SendResponseError("myeeg", "netz linz", "Local address contains control or whitespace", "Send Mail")
+          val s = storeActorProbe.expectMessageType[InitConversation]
+          s.replyTo ! InitDone(s.message)
 
-        println("finish")
+          val edaCommand = edaActorProbe.expectMessageType[PassEdaCommand]
+          edaCommand.replyTo ! SendResponseError("myeeg", "netz linz", "Local address contains control or whitespace", "Send Mail")
 
-        val expectedPayload = EbMsMessage(
-          conversationId = "0", sender = "myeeg", receiver = "netz linz",
-          messageCode = EbMsMessageType.ERROR_MESSAGE,
-          errorMessage = Some("Local address contains control or whitespace"),
-          reason=Some("Send Mail")).asJson.toString
 
-        val testResponse = probe.requestNext()
-        testResponse.topic shouldBe "eda/response/myeeg/protocol/error"
-        testResponse.payload.utf8String shouldBe expectedPayload
+          val expectedPayload = EbMsMessage(
+            conversationId = "0", sender = "myeeg", receiver = "netz linz",
+            messageCode = EbMsMessageType.ERROR_MESSAGE,
+            errorMessage = Some("Local address contains control or whitespace"),
+            reason=Some("Send Mail")).asJson.toString
+
+          val testResponse = probe.requestNext()
+          testResponse.topic shouldBe "eda/response/myeeg/protocol/error"
+          testResponse.payload.utf8String shouldBe expectedPayload
+        } finally stop.shutdown() // runCommand restarts its source: the stream must not outlive the case
       }
+      val logged = LogCapture.messages(events)
+      // dev#45 Q1: the reason is on the attached exception, not in the text
+      events.exists(e => e.getThrowableProxy != null && e.getThrowableProxy.getMessage.contains("Local address contains control or whitespace")) shouldBe true
+      logged.exists(m => m.contains("AT0030000000000000000000000526178") || m.contains("RC103536000000973930")) shouldBe false
+      // dev#45 L13: the error line has the exception, for error.type and the stack
+      events.filter(_.getLevel.toString == "ERROR").forall(_.getThrowableProxy != null) shouldBe true
     }
 
   }

@@ -21,7 +21,6 @@ object Config {
   lazy val adminSrvConfig: AkkaConfig = config.getConfig("epmsmail.admin")
   lazy val adminMailFrom: String = config.getString("epmsmail.admin.from")
   lazy val grpcSrvConfig: AkkaConfig = config.getConfig("app.grpc")
-  lazy val emailDomain = (tenant: String) => config.getString(s"epmsmail.mail.${tenant}.domain")
   lazy val testReceiver: String = config.getString("epmsmail.mail.test.receiver")
   lazy val testEnabled: Boolean = config.getBoolean("epmsmail.mail.test.enable")
   lazy val interval: String => Duration = (domain: String) => config.getDuration(s"epmsmail.mail.${domain}.interval")
@@ -36,14 +35,18 @@ object Config {
     config.getString("epmsmail.mqtt.host"), config.getInt("epmsmail.mqtt.port"), "", "", false,
     None, Some("eda/response"))
 
-  lazy val energyTopic = config.getString("epmsmail.mqtt.topics.energyTopic")
-  lazy val cmTopic = config.getString("epmsmail.mqtt.topics.cmTopic")
-  lazy val cpTopic = config.getString("epmsmail.mqtt.topics.cpTopic")
   lazy val errorTopic = config.getString("epmsmail.mqtt.topics.errorTopic")
 
   def getDomain(domain: String):Map[String, Object] = config.getConfig(s"epmsmail.mail.${domain}.javaxmail").entrySet().asScala.map(e => e.getKey -> e.getValue.unwrapped()).toMap
 
-  def interfaceMode = config.getString("app.interface.mode")
+  /**
+   * Document mode of outbound EDA documents: only PROD or SIMU (any case). Anything else is an
+   * error; it used to fall through to PROD (legally binding) in every builder.
+   */
+  def interfaceMode: String = config.getString("app.interface.mode").trim.toUpperCase match {
+    case m @ ("PROD" | "SIMU") => m
+    case other => throw new IllegalStateException(s"app.interface.mode must be PROD or SIMU, got '$other'")
+  }
 
   def edaKepServer: AkkaConfig = config.getConfig("app.kepserver")
 

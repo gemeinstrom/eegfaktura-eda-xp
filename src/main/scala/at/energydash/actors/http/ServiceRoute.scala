@@ -7,30 +7,32 @@ import org.apache.pekko.http.scaladsl.server.Route
 import org.apache.pekko.util.Timeout
 import at.energydash.domain.EbMsMessage
 import at.energydash.service.FileService
-import com.github.pjfanning.pekkohttpcirce.FailFastCirceSupport._
-import io.circe.generic.auto._
+import org.slf4j.{Logger, LoggerFactory}
 
 import scala.concurrent.ExecutionContextExecutor
-import scala.concurrent.duration.DurationInt
+import scala.concurrent.duration.{DurationInt, FiniteDuration}
 
 case class EcIdUpdateHttpMessage(conversationId: String, ecId: String)
 case class ConversationMessage(conversationId: String, message: EbMsMessage)
 case class ConversationMessages(conversations: Seq[ConversationMessage])
 
-class ServiceRoute(fileService: FileService)(implicit val system: ActorSystem[_]) {
+class ServiceRoute(fileService: FileService, maxBodyBytes: Long)(implicit val system: ActorSystem[_]) {
 
-  import at.energydash.domain.JsonImplicit._
 
   implicit val timeout: Timeout = 3.seconds
   implicit val scheduler: Scheduler = system.scheduler
   implicit val ec: ExecutionContextExecutor = system.executionContext
+
+  private val logger: Logger = LoggerFactory.getLogger(this.getClass)
+  private val bodyLimit = new BodySizeLimit(maxBodyBytes, logger, "Admin upload")
 
   val adminRoutes: Route =
     pathPrefix("admin") {
       concat (
         path("upload") {
           post {
-            withoutSizeLimit {
+            // read completely first: an upload above the limit publishes none of its parts
+            (bodyLimit.directive & toStrictEntity(ServiceRoute.UploadReadTimeout, maxBodyBytes)) {
               optionalHeaderValueByName("ecId") { ecId =>
                 entity(as[Multipart.FormData]) { formData =>
                   onSuccess(fileService.handleUpload(formData, ecId)) { results =>
@@ -65,4 +67,12 @@ class ServiceRoute(fileService: FileService)(implicit val system: ActorSystem[_]
       )
     }
 
+}
+
+object ServiceRoute {
+  /** The paths of [[ServiceRoute.adminRoutes]], for the access line. */
+  val Templates: Set[String] = Set("/admin/upload")
+
+  /** Time to receive an upload completely; the server's request-timeout (20 s default) still applies. */
+  val UploadReadTimeout: FiniteDuration = 60.seconds
 }

@@ -2,7 +2,6 @@ package at.energydash.domain.eda
 
 import at.energydash.domain.EbMsMessage
 import at.energydash.domain.xml.{CMRevokeV0100Document, CMRevokeV0110Document}
-import cmnotification.v01p11._
 import ponton.`package`.{Cmrevokev01p00_CMRevokeFormat, Cmrevokev01p10_CMRevokeFormat}
 import scalaxb.CanWriteXML
 
@@ -14,7 +13,7 @@ case class CMRevokeRequest(message: EbMsMessage) extends EdaMessage {
     case Some("01.02") => Try(CMRevokeRequestV0100(message))
     case Some("01.10") => Try(CMRevokeRequestV0110(message))
     case Some("01.30") => Try(CMRevokeRequestV0130(message))
-    case _ => Try(CMRevokeRequestV0110(message))
+    case _ => fallbackVersion()
   }
 }
 

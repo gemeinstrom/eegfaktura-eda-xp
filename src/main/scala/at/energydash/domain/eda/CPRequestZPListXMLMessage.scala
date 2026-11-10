@@ -7,23 +7,25 @@ import scalaxb.{CanWriteXML, Helper}
 
 import java.util.{Calendar, TimeZone}
 import scala.util.Try
-import scala.xml.{NamespaceBinding, Node, TopScope}
+import scala.xml.{NamespaceBinding, Node}
 
 case class CPRequestZPList(message: EbMsMessage) extends EdaMessage {
   override def getVersion(version: Option[String] = None): Try[EdaXMLMessage[_]] = message.messageCodeVersion match {
-    case Some("02.00") => Try(CPRequestZPListXMLMessageV0200(message))
-    case _ => Try(CPRequestZPListXMLMessageV0200(message))
+    // EC_PODLIST 02.10 (ab 05.10.2026): Prozessversion und Schemaset sind beide 02.10, gleiches XML
+    // (cprequest 01p12); nur die Version im Ponton-Header und im schemaLocation-Pfad aendert sich.
+    case Some(v @ ("02.00" | "02.10")) => Try(CPRequestZPListXMLMessageV0200(message, v))
+    case _ => fallbackVersion()
   }
 }
 
-case class CPRequestZPListXMLMessageV0200(message: EbMsMessage) extends EdaXMLMessage[cprequest.v01p12.CPRequest] {
+case class CPRequestZPListXMLMessageV0200(message: EbMsMessage, processVersion: String = "02.00") extends EdaXMLMessage[cprequest.v01p12.CPRequest] {
   import java.util.GregorianCalendar
 
   override implicit val edaTypeCanWrite: CanWriteXML[cprequest.v01p12.CPRequest] = Cprequestv01p12_CPRequestFormat
   override def rootNodeLabel: Some[String] = Some("CPRequest")
 
   override def schemaLocation: Option[String] = Some("http://www.ebutilities.at/schemata/customerprocesses/cprequest/01p12 " +
-    "http://www.ebutilities.at/schemata/customerprocesses/EC_PODLIST/02.00/ANFORDERUNG_ECP")
+    s"http://www.ebutilities.at/schemata/customerprocesses/EC_PODLIST/$processVersion/ANFORDERUNG_ECP")
 
   def toDoc: cprequest.v01p12.CPRequest = CPRequestV0112Document(message)
     .withExtension(message.timeline.map(t => {
@@ -45,12 +47,5 @@ case class CPRequestZPListXMLMessageV0200(message: EbMsMessage) extends EdaXMLMe
 
   def toXML: Node = {
     scalaxb.toXML[cprequest.v01p12.CPRequest](toDoc, schemaLocation, rootNodeLabel, toScope, true).head
-  }
-
-  private def defineNamespaceBinding(): NamespaceBinding = {
-    val nsb2 = NamespaceBinding("schemaLocation", "http://www.ebutilities.at/schemata/customerprocesses/cprequest/01p12/CPRequest_01p12.xsd", TopScope)
-    val nsb3 = NamespaceBinding("xsi", "http://www.w3.org/2001/XMLSchema-instance", nsb2)
-    val nsb4 = NamespaceBinding("cp", "http://www.ebutilities.at/schemata/customerprocesses/cprequest/01p12", TopScope)
-    NamespaceBinding(null, "http://www.ebutilities.at/schemata/customerprocesses/common/types/01p20", nsb2)
   }
 }

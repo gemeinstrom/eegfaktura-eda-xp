@@ -41,6 +41,27 @@ sbt clean compile   # runs scalaxb XSD codegen + Pekko gRPC protoc codegen
 sbt test
 ```
 
+## Tests
+
+```bash
+bash scripts/dev/test.sh                  # whole suite (local sbt, or the pinned sbt image via docker)
+bash scripts/dev/test.sh --only '*TenantProviderSpec'
+bash scripts/dev/test.sh --fast           # without the Slow-tagged robustness tests (~1.5 min instead of ~3.5)
+bash scripts/dev/test.sh --coverage       # + scoverage report and the coverage floors
+bash scripts/dev/test.sh --update-golden  # rewrite the protocol golden files, then review `git diff`
+```
+
+- Everything a test talks to is a loopback stand-in started by the tests: embedded PostgreSQL (a free port per run,
+  migrated with the production migrations), embedded MQTT broker (18831), a fake Ponton messenger (16060).
+  **No test ever sends to a real KEP endpoint.** Configuration: `src/test/resources/application-test.conf`.
+- Files a run writes stay under `target/`; the JVM runs in `Europe/Vienna`.
+- A known defect is tested as `knownError("<id>") { … }`: the test asserts the correct behaviour, is
+  reported as *pending* while the defect exists and fails once it is fixed (remove the marker with the fix).
+- **Protocol catalog** (`src/test/resources/protocol/`): one row per outbound message code and version
+  label; each row is a test (builder chosen, Ponton header, XSD-valid document, golden document). A new
+  process version is tested by adding its row — see "Adding a new EDA process version" below.
+- CI: `.github/workflows/test.yml` runs the suite with coverage before the image is built.
+
 ## Run
 
 Local (requires PostgreSQL and an MQTT broker):
@@ -66,11 +87,91 @@ docker run -p 6090:6090 -p 9093:9093 \
 - `app.interface.mode` — `SIMU` (simulation) or `PROD`
 - `app.kepserver.url` — Ponton X/P outbound endpoint
 - `app.server.port` (HTTP, 6090), `app.grpc.port` (gRPC, 9093)
+- `app.forward` — communities that moved to another zone (e.g. the pilot): `RC number = "URL of the
+  other adapter's /pontonxp/message"`. The key is the RC number in the Ponton header ReceiverId, not the
+  tenant: all GEA tenants of one RC number move together. Inbound Ponton messages whose ReceiverId is
+  listed are forwarded unchanged (body, content type, SOAPAction) instead of being processed here; the
+  other adapter's answer decides what Ponton gets (2xx → 204, anything else or no answer within 10 s →
+  500 (`app.forward-timeout`), so Ponton redelivers — at least once, like Ponton itself: a target that finishes after the
+  timeout processes the message, and Ponton's redelivery a second time). Empty by default: the route is then exactly the previous one. With entries, every message
+  (forwarded or not) is read completely (up to `app.max-body-size`) and must arrive within 8 s
+  (`app.forward-read-timeout`).
+  An entry that is not an absolute http(s) URL with a host, or the same RC number twice, stops the start.
+  `/status` and `/notification` are not forwarded (only logged). A forwarded request carries
+  `X-Eegfaktura-Forwarded`; an adapter that would forward it again refuses it (500) to avoid a loop.
+  **Finding a loop:** it shows only as ERROR lines `arrived already forwarded` in the log and Ponton
+  redelivering the same message; check `app.forward` in both zones (the target must not list the RC number).
+  A forwarded duplicate (target answered after the timeout, Ponton redelivered) is processed twice by the
+  target: an extra history/notification row in the backend, energy slots overwritten with the same values.
+- `app.forward-read-timeout` (8 s, env `FORWARD_READ_TIMEOUT`, always with unit, e.g. `15s`), `app.forward-timeout` (10 s, env
+  `FORWARD_TIMEOUT`, with unit) — the two deadlines above, adjustable without a release. Together they should stay below
+  `pekko.http.server.request-timeout` (20 s); the adapter warns at start when they reach it.
+- `app.max-body-size` (128 MiB, env `MAX_BODY_SIZE`, with unit, e.g. `256m`) — largest request body on `/pontonxp/*`
+  and `/admin/upload`; larger requests get 413 and a WARN line `body larger than the limit` with the declared size.
+  Keep it the same in both zones when `app.forward` is used: a target with a lower limit answers 413, logged here
+  as ERROR `refused as too large`, and Ponton redelivers.
+  Inbound Ponton messages above 16 MiB are logged at INFO with their size (search key `ponton-message-size`).
+- Inbound messages processed here (`/pontonxp/message`) are answered 204 once they are in the MQTT
+  publishing stream (buffer of 2000); from there they are published, also after the client reconnects to
+  a restarted broker. They are answered 500 (ERROR line `not handed to MQTT … Ponton will redeliver`)
+  when they cannot be published: MQTT not connected (start, or restart backoff of 4 s to 1 min after a
+  client stream failure, e.g. a publish in flight when the broker connection drops), the eda-xp database
+  lookup fails or times out (aggregator, merge error), or the buffer is full. This also applies to unknown
+  document types. The route gives up at the latest after 10 s, and always 2 s before
+  `pekko.http.server.request-timeout` counted from the moment the body is read; a message answered 500 is never
+  published later. Each retry of a message refused by a merge error or aggregator failure publishes
+  the `error` notification (not when the aggregator does not answer within 5 s), so the backend gets one error entry per Ponton retry during an
+  eda-xp database outage. Still lost, as before: messages already in the buffer when the client stream
+  fails. **Runbook after 500s:**
+  1. Find the window: search the eda-xp log (Dynatrace) for `not handed to MQTT`; the window runs from the
+     first such line until the next successfully processed message (no more such lines). Note the
+     conversation ids of the lines.
+  2. In the Ponton message monitor, look for inbound messages of that window in state FAILED or not
+     delivered (exact menu path and status names to be confirmed by operations).
+  3. Resend them to the adapter. That is safe: energystore stores energy values idempotently; the backend
+     may get an extra `base.processhistory` row.
+  4. Afterwards check `base.processhistory` for the conversation ids from step 1 (read-only).
+  5. Not verified yet: whether Ponton redelivers on its own after a 500.
 - `epmsmail.*` — IMAP/SMTP accounts for EDA-over-email
+- `epmsmail.admin.javaxmail.mail.smtp.{connectiontimeout,timeout,writetimeout}` (10 s / 20 s / 20 s; env
+  `SMTP_ADMIN_CONNECTION_TIMEOUT`, `SMTP_ADMIN_TIMEOUT`, `SMTP_ADMIN_WRITE_TIMEOUT`; milliseconds or with unit,
+  e.g. `20s`; an invalid value stops the start) — SMTP timeouts of the gRPC `SendMailService`. Its reply status
+  (contract with the backend): 200 sent; 202 `SMTP unconfirmed: …` — the message was sent completely but the relay's
+  reply to it did not arrive in time, so it was most likely delivered (do not resend); 504 `SMTP timeout: …` —
+  timeout before the message was sent (connect, greeting, a command), nothing delivered; 500 any other error.
 - `slick.pgsql.local.db.*` / `flyway.*` — PostgreSQL connection + migrations
 
 Environment variables (names only): `SMTP_ADMIN_SERVER_HOST`, `SMTP_ADMIN_SERVER_PORT`,
-`EMAIL_ADMIN_USER`, `EMAIL_ADMIN_PWD`, `TZ`, `JAVA_OPTS`.
+`SMTP_ADMIN_CONNECTION_TIMEOUT`, `SMTP_ADMIN_TIMEOUT`, `SMTP_ADMIN_WRITE_TIMEOUT`, `EMAIL_ADMIN_USER`, `EMAIL_ADMIN_PWD`, `FORWARD_READ_TIMEOUT`, `FORWARD_TIMEOUT`, `MAX_BODY_SIZE`, `TZ`, `JAVA_OPTS`,
+`LOG_FORMAT`, `LOG_LEVEL`, `SLICK_LOG_LEVEL`, `SERVICE_VERSION`, `DEPLOYMENT_ENVIRONMENT`.
+
+### Logging
+
+Every line goes through one encoder (`src/main/resources/logback.xml`, `at.energydash.logging`) to stdout:
+
+- `LOG_FORMAT` — `json` (default): one JSON object per line with flat ECS names (`@timestamp` UTC,
+  `log.level`, `log.logger`, `service.name` `eegfaktura-eda-xp`, `service.version`, `message`, `error.*`, and when
+  known `request.id`, `tenant.id`, `eda.conversation_id`, …); other MDC entries are not written. `text`: the same
+  fields as a plain line for reading in a terminal. `tenant.id` is written only in the shape of a tenant (upper case,
+  `^[A-Z0-9][A-Z0-9_-]{0,63}$`).
+- `LOG_LEVEL` — `trace`, `debug`, `info` (default), `warn` (also `warning`), `error`; `SLICK_LOG_LEVEL` the same for the `slick`
+  loggers only. An unknown value stops the start (exit code 2); an empty value means the default.
+- `SERVICE_VERSION` — set by the image build (the version without `v` for a tag build, else the commit, which a retagged image keeps); `dev` from source.
+- `DEPLOYMENT_ENVIRONMENT` — `deployment.environment` of every line (JSON and text) (`dev`, `pilot`, `prod`); the field is left
+  out when unset or empty.
+- Start-up line `service start` (`event.action=service.start`, `log.effective_level`), at any `LOG_LEVEL`.
+- An error line has a fixed text and the exception (`error.type`, `error.message`, `error.stack_trace`); the message
+  of the exception and of its causes is masked (no document, no e-mail address).
+- java.util.logging (gRPC, pgjdbc, paho) goes through the same encoder.
+- Lines of an HTTP request on port 6090 carry its `request.id`, and `tenant.id` once the message is parsed; not the
+  lines of the actors behind the route.
+- Access line (`event.action=http.access`, logger `at.energydash.access`): one line per request on port 6090 with
+  method, route, status, `event.outcome`, `event.duration` (ns), `request.id` (`X-Request-Id`, also returned),
+  `client.id=ponton` on `/pontonxp/*`, and `tenant.id`/`eda.conversation_id` once the message is parsed. Never an
+  IP, user agent, query or body. `/healthz` and `/readyz` are not logged.
+- Never logged: EDA XML, MQTT payloads, mail bodies/attachments, e-mail addresses of members. `NeverLogSpec` reads
+  the log calls of the source, not `.addKeyValue(` or `println`: a new value in a log line needs an entry for its file
+  with a reason in its allowlist; the text of an exception in the message and a word of the never-log list fail.
 
 Exposed ports: **6090** (HTTP), **9093** (gRPC). Volumes: `/conf`, `/storage/prod`.
 
@@ -85,7 +186,11 @@ selected here by string match. Two coupled places must be updated **in order**:
    scalaxb binding on `sbt compile`), add the concrete message class, and add a
    `case Some("<xx.yy>")` branch in the relevant `getVersion()` (e.g.
    `domain/eda/CMRevokeRequest.scala`). Note the `case _` default falls back to an
-   **older** version silently — an unmatched string does not error, it downgrades.
+   **older** version — an unmatched string does not error, it downgrades (since 1.0.5
+   with a WARN log naming the label).
+   Then add the row for the new label to `src/test/resources/protocol/catalog.conf` (builder, XSD, Ponton
+   header), run `bash scripts/dev/test.sh --only '*Protocol*' --update-golden` and review the new golden
+   files with `git diff` before committing them.
 2. **eegfaktura-backend config** `eda-process-versions.<CODE>`: bump the value to the
    new version. The backend stamps it onto `MessageCodeVersion`
    (`mqtt/messageBroker.go`) and this service uses it to pick the schema above. Bump
@@ -96,7 +201,62 @@ selected here by string match. Two coupled places must be updated **in order**:
 Discovery of new EDA publications is covered by the monthly **EDA-Prozessversionen-Watcher**
 routine (claude.ai/code/routines), which pings only when a published version exceeds the
 list it tracks. Codes not routed in `MessageHelper.getEdaMessageByType` (e.g. `CCMO`, `ECC`)
-or hard-coded (`CPF`, `GN`) ignore the config value.
+or hard-coded (`GN`) ignore the config value.
+
+### The version label is the schema set version, not the process version
+
+Since the EDA change of 2026-10-05, the process version on ebUtilities and the schema set
+version differ (e.g. `EC_REQ_ONL` process 03.00 → schema set `EC_REQ_ONL_02.40`). The config
+value must be the **schema set version** — the number in the schema set name
+(`EC_PODLIST_02.10` → `02.10`). The ebUtilities API returns the schema set per process
+version without login:
+
+```bash
+curl -s -X POST -H 'Content-Type: application/json' -d '{}' https://www.ebutilities.at/api/processes/list   # find the process uid
+curl -s https://www.ebutilities.at/api/processes/show/<uid>                                               # field "schemaset"
+curl -s https://www.ebutilities.at/api/market-notifications/process/<uid>/notifications/list               # message codes + payload schema (namespace, XSD link)
+```
+
+### Ponton header: message type, not process code
+
+The SOAP header sent to the Ponton EDA webservice adapter (`PontonRequest`, `OutHeaderType`)
+must carry the **message type and version from the schema set definition**:
+
+| Header field | Value | Example |
+|---|---|---|
+| `MessageType` | message code of the schema set entry | `ANFORDERUNG_ECP` (not `EC_PODLIST`) |
+| `MessageVersion` | schema set version | `02.10` (not the process version) |
+
+Source: PONTON X/P 5.2 *Backend Integration Guide*, ch. 2.1.1 — "MessageName and
+DTDVersionNumber need to match the attributes MessageType and MessageVersion found in the
+schema-set definition files". The messenger GUI shows the same pairs under
+*Messenger → Schema* (columns *Typ* / *Version*), and the inbound header already carries the
+message type (`src/test/resources/Response-Envelope.xml`: `SENDEN_ECP`).
+
+`MessageHelper.pontonHeaderMessageType` decides per request. ECP, ECON, ECOF and CPF send the
+message type (since 1.0.6/1.0.7). PT and CCMS still send the process code; with the old schema
+sets the adapter accepted that, with the new sets of 2026-10-05 it did not
+(`No activated XML Schema for MessageType:EC_PODLIST Version:02.10`, although the set was
+active on local partner, remote partner and agreement). Switch PT/CCMS to the message type
+together with their next version change.
+
+### Checklist before an EDA cut-over date
+
+1. Per process this service sends: schema set + message codes + payload schema from the
+   ebUtilities API (above). A new payload namespace (e.g. CPF 01.10 → ECMPList **01p20**) means
+   a new builder, not just a new label; check new **mandatory** fields against the published
+   XSD and, if the meaning is unclear, against a real message from a grid operator
+   (Ponton *Message Monitor* → message → *Raw Message*).
+2. Add the `getVersion()` case and make sure the header uses the message type (see above).
+   Validate the built XML against the published XSD in a test (see `ECPartitionChangeSpec`).
+3. Bump the backend config (all copies, see above) and restart the backend — it reads the
+   config only at startup.
+4. After the rollout send **one** request per process and check the status in the logs
+   (`PontonRoute - Status from EDA`: `1` sent, `2` received, `12` rejected by the messenger).
+   Compare a rejected header with *Messenger → Schema* before suspecting the messenger.
+5. Grid operators deactivate the old schema sets in their registry profiles on the cut-over
+   date, and remote partners are imported from the registry — rolling back to old labels does
+   not work.
 
 ## Dependencies
 

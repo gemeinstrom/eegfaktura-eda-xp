@@ -4,16 +4,14 @@ import at.energydash.domain.enums.{EbMsMessageType, MeterDirectionType}
 import at.energydash.domain.{EbMsMessage, Meter}
 import io.circe.generic.auto._
 import io.circe.parser._
+import org.scalatest.EitherValues
 import org.scalatest.matchers.should.Matchers
 import org.scalatest.wordspec.AnyWordSpecLike
 import ponton.OutHeaderType
-import ponton.`package`.__NodeXMLFormat
-import scalaxb.DataRecord
-import soapenvelope11.{Body, Envelope, Header}
 
 import scala.xml.NamespaceBinding
 
-class CPRequestZPListXMLMessageSpec extends AnyWordSpecLike with Matchers {
+class CPRequestZPListXMLMessageSpec extends AnyWordSpecLike with Matchers with EitherValues {
     import at.energydash.domain.JsonImplicit._
 
     "Request POD_LIST Message" should {
@@ -46,31 +44,16 @@ class CPRequestZPListXMLMessageSpec extends AnyWordSpecLike with Matchers {
 
         val xmlObj = CPRequestZPList(testMessage).getVersion().get
         val record = xmlObj.toRecord
-        println(record)
 
         val node = CPRequestZPList(testMessage).getVersion().map(_.toXML).get
-        println(node)
+        (node \ "ProcessDirectory" \ "ConversationId").text shouldBe testMessage.conversationId
 
         val body = ponton.OutboundMessage(outboundmessageoption = record)
-//        scalaxb.toXML(ponton.OutboundDocument(header, body), targetNamespace, "OutboundDocument",
-//          scalaxb.toScope(scalaxb.fromScope(scope).foldRight(scalaxb.fromScope(xmlObj.toScope)){ (a, b) => a :: b }.reverse : _*/*.distinct: _**/)
-//        )
         val bodyDoc = scalaxb.toXML(ponton.OutboundDocument(header, body), None, Some("OutboundDocument"),
           scalaxb.toScope(scalaxb.fromScope(scope).foldRight(scalaxb.fromScope(xmlObj.toScope)){ (a, b) => a :: b }.reverse : _*/*.distinct: _**/), true
         )
-        println(bodyDoc)
 
-        val headers = Nil
-        val bodyRecords = bodyDoc.toSeq map { DataRecord(None, None, _) }
-        val headerOption = headers.toSeq.headOption map { _ =>
-          Header(headers.toSeq map {DataRecord(None, None, _)}, Map())
-        }
-        val envelope = Envelope(headerOption, Body(bodyRecords, Map()), Nil, Map())
-
-//        (node \ "MarketParticipantDirectory" \ "MessageCode").text shouldBe EbMsMessageType.ONLINE_REG_INIT.toString
-//        (node \ "ProcessDirectory" \ "MeteringPoint").text shouldBe "AT0030000000000000000000000655856"
-//        (node \ "ProcessDirectory" \ "CMRequest" \ "ECID").text shouldBe "AT00300000000RC100181000000956509"
-//        (node \ "ProcessDirectory" \ "CMRequest" \ "EnergyDirection").text shouldBe MeterDirectionType.CONSUMPTION.toString
+        (bodyDoc \\ "MessageId").head.text shouldBe "10000"
       }
     }
 
@@ -108,12 +91,31 @@ class CPRequestZPListXMLMessageSpec extends AnyWordSpecLike with Matchers {
 
         val message = decode[EbMsMessage](jsonObjectStr)
 
-        val node = message match {
-          case Right(m) => CMRequestRegistrationOnlineXMLMessageV0200(m).toXML
-        }
+        val node = CMRequestRegistrationOnlineXMLMessageV0200(message.value).toXML
         (node \\ "ECPartFact").text shouldBe "90"
         (node \\ "ProcessDirectory" \ "MeteringPoint").text shouldBe "AT0020000000000000000000020901971"
-        println(node)
       }
     }
+
+  "ECP — Versionskennung 02.00 (cprequest 01p12)" in {
+    val msg = EbMsMessage(
+      conversationId = "RC100130202310051506080740000003762",
+      sender = "RC100130", receiver = "AT003000", messageCode = EbMsMessageType.ZP_LIST,
+      messageCodeVersion = Some("02.00"),
+      ecId = Some("AT00300000000RC100130000000952832"))
+    val xml = CPRequestZPList(msg).getVersion().get
+    xml.schemaLocation.get should include("cprequest/01p12")
+    xml.schemaLocation.get should endWith("customerprocesses/EC_PODLIST/02.00/ANFORDERUNG_ECP")
+  }
+
+  "ECP — Versionskennung 02.10 (cprequest 01p12)" in {
+    val msg = EbMsMessage(
+      conversationId = "RC100130202310051506080740000003762",
+      sender = "RC100130", receiver = "AT003000", messageCode = EbMsMessageType.ZP_LIST,
+      messageCodeVersion = Some("02.10"),
+      ecId = Some("AT00300000000RC100130000000952832"))
+    val xml = CPRequestZPList(msg).getVersion().get
+    xml.schemaLocation.get should include("cprequest/01p12")
+    xml.schemaLocation.get should endWith("customerprocesses/EC_PODLIST/02.10/ANFORDERUNG_ECP")
+  }
 }
